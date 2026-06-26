@@ -6,54 +6,158 @@
 [![Release](https://img.shields.io/github/v/release/ggml-org/llama.cpp)](https://github.com/ggml-org/llama.cpp/releases)
 [![Server](https://github.com/ggml-org/llama.cpp/actions/workflows/server.yml/badge.svg)](https://github.com/ggml-org/llama.cpp/actions/workflows/server.yml)
 
-[Manifesto](https://github.com/ggml-org/llama.cpp/discussions/205) / [ggml](https://github.com/ggml-org/ggml) / [ops](https://github.com/ggml-org/llama.cpp/blob/master/docs/ops.md)
+LLM inference powered by **XDL RPP Accelerator**.
 
-LLM inference in C/C++
+---
 
-## Recent API changes
+# XDL RPP Backend
 
-- [Changelog for `libllama` API](https://github.com/ggml-org/llama.cpp/issues/9289)
-- [Changelog for `llama-server` REST API](https://github.com/ggml-org/llama.cpp/issues/9291)
+This repository provides native **XDL RPP** backend support for **llama.cpp**, enabling efficient inference of GGUF large language models on XDL AI accelerators while maintaining full compatibility with the upstream llama.cpp project.
 
-## Hot topics
+## Features
 
-- **Hugging Face cache migration: models downloaded with `-hf` are now stored in the standard Hugging Face cache directory, enabling sharing with other HF tools.**
-- **[guide : using the new WebUI of llama.cpp](https://github.com/ggml-org/llama.cpp/discussions/16938)**
-- [guide : running gpt-oss with llama.cpp](https://github.com/ggml-org/llama.cpp/discussions/15396)
-- [[FEEDBACK] Better packaging for llama.cpp to support downstream consumers 🤗](https://github.com/ggml-org/llama.cpp/discussions/15313)
-- Support for the `gpt-oss` model with native MXFP4 format has been added | [PR](https://github.com/ggml-org/llama.cpp/pull/15091) | [Collaboration with NVIDIA](https://blogs.nvidia.com/blog/rtx-ai-garage-openai-oss) | [Comment](https://github.com/ggml-org/llama.cpp/discussions/15095)
-- Multimodal support arrived in `llama-server`: [#12898](https://github.com/ggml-org/llama.cpp/pull/12898) | [documentation](./docs/multimodal.md)
-- VS Code extension for FIM completions: https://github.com/ggml-org/llama.vscode
-- Vim/Neovim plugin for FIM completions: https://github.com/ggml-org/llama.vim
-- Hugging Face Inference Endpoints now support GGUF out of the box! https://github.com/ggml-org/llama.cpp/discussions/9669
-- Hugging Face GGUF editor: [discussion](https://github.com/ggml-org/llama.cpp/discussions/9268) | [tool](https://huggingface.co/spaces/CISCai/gguf-editor)
-- WebGPU support is now available in the browser, see a blog/demo introducing it [here](https://reeselevine.github.io/llamas-on-the-web/).
+- Native AzurEngine RPP backend
+- GGUF model support
+- BF16 inference
+- Weight Cache acceleration
+- Continuous batching
+- OpenAI-compatible REST API
+- Built-in WebUI
+- Compatible with upstream llama.cpp
 
-----
+---
 
-## Quick start
+# Supported Models
 
-Getting started with llama.cpp is straightforward. Here are several ways to install it on your machine:
+The following models have been validated on the RPP backend.
 
-- Install `llama.cpp` using [brew, nix or winget](docs/install.md)
-- Run with Docker - see our [Docker documentation](docs/docker.md)
-- Download pre-built binaries from the [releases page](https://github.com/ggml-org/llama.cpp/releases)
-- Build from source by cloning this repository - check out [our build guide](docs/build.md)
+| Model | Format | Status |
+|---------|--------|--------|
+| Qwen3-8B | GGUF | ✅ Supported |
+| Qwen3-30B-A3B | GGUF | ✅ Supported |
 
-Once installed, you'll need a model to work with. Head to the [Obtaining and quantizing models](#obtaining-and-quantizing-models) section to learn more.
+Additional GGUF models will be supported in future releases.
 
-Example command:
+---
 
-```sh
-# Use a local model file
-llama-cli -m my_model.gguf
+# Prerequisites
 
-# Or download and run a model directly from Hugging Face
-llama-cli -hf ggml-org/gemma-3-1b-it-GGUF
+Before building llama.cpp, make sure:
 
-# Launch OpenAI-compatible API server
-llama-server -hf ggml-org/gemma-3-1b-it-GGUF
+- XDL SDK has been installed.
+- RPP Driver is loaded successfully.
+- `rpp_server` is running.
+- CMake >= 3.20
+- GCC >= 9
+
+---
+
+# Quick Start
+
+## 1. Build llama.cpp
+
+```bash
+cd llama.cpp
+
+mkdir -p build
+cd build
+
+cmake .. \
+    -DGGML_RPP=ON \
+    -DGGML_RPP_USE_UBATCH=ON \
+    -DGGML_RPP_USE_BF16=ON \
+    -DGGML_RPP_USE_DFS=ON \
+    -DLLAMA_CURL=OFF \
+    -DCMAKE_BUILD_TYPE=Debug
+
+make -j$(nproc)
 ```
+
+---
+
+## 2. Download GGUF Model
+
+Download one of the validated GGUF models from Hugging Face.
+
+Example directory layout:
+
+```text
+$HOME/model/llama.cpp/
+
+├── Qwen3-8B-Q4_K_M.gguf
+└── Qwen3-30B-A3B-IQ2_M.gguf
+```
+
+---
+
+## 3. Configure Runtime
+
+Append the following environment variables to `~/.bashrc`.
+
+```bash
+export GGML_RPP_WEIGHTS_CACHE_FILE=$HOME/model/llama.cpp/model_cache.weights
+
+export GGML_RPP_MAX_CONTEXT=8192
+export GGML_RPP_BATCH_SIZE=512
+export GGML_RPP_STUB_KV_STEP=32
+```
+
+Reload:
+
+```bash
+source ~/.bashrc
+```
+
+---
+
+## 4. Launch llama-server
+
+```bash
+cd build/bin
+
+./llama-server \
+    -m $HOME/model/llama.cpp/Qwen3-30B-A3B-IQ2_M.gguf \
+    --host 0.0.0.0 \
+    --port 8080 \
+    -c 8192 \
+    -ctk bf16 \
+    -ctv bf16 \
+    --no-warmup \
+    -ub 512 \
+    --fit off \
+    --jinja \
+    -np 1
+```
+
+> **Note**
+>
+> During the first launch, the RPP backend builds a Weight Cache.
+> This process may take several minutes.
+> Subsequent launches will automatically reuse the generated cache.
+
+---
+
+## 5. Access WebUI
+
+Open:
+
+```
+http://<HOST_IP>:8080
+```
+
+OpenAI-compatible REST API:
+
+```
+POST /v1/chat/completions
+```
+
+---
+
+# Original llama.cpp Documentation
+
+The following sections are preserved from the upstream llama.cpp project and remain fully applicable to the AzurEngine RPP backend.
+
+---
 
 ## Description
 
