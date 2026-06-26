@@ -1,0 +1,29 @@
+{
+	"kernel_type": "app",
+	"kernel_num": 3,
+	"kernel_name": [
+		"llm_scale",
+		"opt_vector_cvt_f16_f32_opt",
+		"opt_vector_cvt_32_16"
+	],
+	"output_dir": "./",
+	"asm_source_dir": "./",
+	"elf_name": "scale",
+	"is_dummy": false,
+	"llm_scale": {
+		"asm_source": "llm_scale.s",
+		"concat_store": false,
+		"is_forward": true,
+		"is_compiler": false
+	},
+	"opt_vector_cvt_f16_f32_opt": {
+		"asm_source": "opt_vector_cvt_f16_f32_opt.s",
+		"concat_store": false,
+		"is_forward": false
+	},
+	"opt_vector_cvt_32_16": {
+		"asm_source": "opt_vector_cvt_32_16.s",
+		"concat_store": false,
+		"is_forward": true
+	}
+}

@@ -1,0 +1,78 @@
+{
+	"kernel_type": "app",
+	"kernel_num": 10,
+	"kernel_name": [
+		"opt_reduce_f16",
+		"opt_aln_reduce_f16",
+		"opt_aln_z32_reduce_f16",
+		"opt_gen_reduce_f16",
+		"gen_reduce_f16",
+		"matrix_norm_sub_pow",
+		"llm_add_rsqrt_lut",
+		"matrix_norm_sub_mul",
+		"opt_vector_cvt_f16_f32_opt",
+		"opt_vector_cvt_32_16"
+	],
+	"output_dir": "./",
+	"asm_source_dir": "./",
+	"elf_name": "norm",
+	"is_dummy": false,
+	"opt_reduce_f16": {
+		"asm_source": "opt_reduce_f16.s",
+		"concat_store": false,
+		"is_forward": true,
+		"is_compiler": false
+	},
+	"opt_aln_reduce_f16": {
+		"asm_source": "opt_aln_reduce_f16.s",
+		"concat_store": false,
+		"is_forward": true,
+		"is_compiler": false
+	},
+	"opt_aln_z32_reduce_f16": {
+		"asm_source": "opt_aln_z32_reduce_f16.s",
+		"concat_store": false,
+		"is_forward": true,
+		"is_compiler": false
+	},
+	"opt_gen_reduce_f16": {
+		"asm_source": "opt_gen_reduce_f16.s",
+		"concat_store": false,
+		"is_forward": true,
+		"is_compiler": false
+	},
+	"gen_reduce_f16": {
+		"asm_source": "gen_reduce_f16.s",
+		"concat_store": false,
+		"is_forward": true,
+		"is_compiler": false
+	},
+	"matrix_norm_sub_pow":{
+		"asm_source": "matrix_norm_sub_pow.s",
+		"concat_store": false,
+		"is_forward": true,
+		"is_compiler": false
+	},
+	"llm_add_rsqrt_lut":{
+		"asm_source": "llm_add_rsqrt_lut.s",
+		"concat_store": false,
+		"is_forward": true,
+		"is_compiler": false
+	},
+	"matrix_norm_sub_mul":{
+		"asm_source": "matrix_norm_sub_mul.s",
+		"concat_store": false,
+		"is_forward": true,
+		"is_compiler": false
+	},
+	"opt_vector_cvt_f16_f32_opt": {
+		"asm_source": "opt_vector_cvt_f16_f32_opt.s",
+		"concat_store": false,
+		"is_forward": false
+	},
+	"opt_vector_cvt_32_16": {
+		"asm_source": "opt_vector_cvt_32_16.s",
+		"concat_store": false,
+		"is_forward": true
+	}
+}

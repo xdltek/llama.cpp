@@ -1,0 +1,193 @@
+    .param	.U32	input
+    .param	.U32	output
+	.param	.U32	src_x_stribe
+	.param	.U32	src_y_stribe
+	.param	.U32	load_jump_size1
+	.param	.U32	load_jump_size2
+	.param	.U32	store_jump_size
+	.param	.U32	loop_row
+	.param	.U32	loop_block
+	.param	.U32	outputPad
+
+
+	LDPARAM.U16 [tid_xyz], S0
+	LDPARAM.U16 [tbDim.x], S1
+	LDPARAM.U16 [tbDim.y], S2
+	CFGXYZ S1, S2, S0
+	MOVE.U32 0, VAB
+	MMOV 0, DVA
+	##
+	COPY VAB, IAB
+	COPY VAB, ICD
+	COPYEXT VAB, IEF
+	COPYEXT VAB, IGH
+	##
+	LDPARAM.U32 [tid_base], DS0
+	LDPARAM.U32 [tid_depack], DS1
+    LOADCONT DS0, MB
+	COPYEXT MB, IG
+	DECTID.X MB, DS1, VA
+	##
+	CVT.U16.U32 VA, VAB
+	##
+	LDPARAM.U32 [src_x_stribe], DS10
+	LDPARAM.U32 [loop_row], DS8
+	MOVE.U16 64, S26
+	MOVE.U16 0, S27
+	MUL.U32.LOW DS8, DS13, DS2
+	LDPARAM.U32 [outputPad], DS3
+	ADD.U32 DS2, DS3, DS2
+	MUL.U32.LOW VAB, DS10, VAB
+	##
+	COPY VAB, IAB
+	LDPARAM.U32 [input], DS11
+	LDPARAM.U32 [output], DS12
+
+	LDPARAM.U32 [src_y_stribe], DS6	//%stribeY
+	LDPARAM.U32 [loop_block], DS9
+	LDPARAM.U32 [store_jump_size], DS7
+	MOVE.U16 2, S6
+	MMOV DS11, DVA
+	DECTID.Z IG, DS1, VA
+	##
+	CVT.U16.U32 VA, VAB
+	##
+	MOVE.U32 16, DS0	//src_y_stribe
+	MADD DVA, IAB, DVA
+	MUL.U32.LOW VAB, DS0, VAB
+	##
+	MADD DVA, VAB, DVA
+	##
+	MOVE.U16 3, S0
+	MOVE.U16 12, S1
+	MOVE.U16 48, S2
+	MOVE.U16 192, S3
+	MOVE.U16 0, S17
+	MOVE.U32 0, DS4
+	MOVE.U32 0, DS5
+$LOOP:
+	##
+	MADD.SCA32 DVA, DS5, DVA
+	##
+    //0, 4097, 4097*2               at cycle 0
+	//8, 4097+8, 4097*2+8           at cycle 1
+	LOADMASK [DVA], S0, MA
+    ADD.U16 MA, 0, VA
+	##
+	LOADMASK [DVA], S1, MA
+    MERGEMASK VA, MA, S1, VA
+	##
+	LOADMASK [DVA], S2, MA
+    MERGEMASK VA, MA, S2, VA
+	##
+	LOADMASK [DVA], S3, MA
+	MERGEMASK VA, MA, S3, VA
+	##
+	MADD DVA, 2, DVA
+	STOREALN.Z32 DS12, S17, DS6, VA
+	##
+	//1, 4097+1, 4097*2+1          at cycle 0
+	//9, 4097+9, 4097*2+9          at cycle 1
+	ADD.U32 DS12, DS2, DS12
+	LOADMASK [DVA], S0, MA
+    ADD.U16 MA, 0, VA
+	##
+	LOADMASK [DVA], S1, MA
+    MERGEMASK VA, MA, S1, VA
+	##
+	LOADMASK [DVA], S2, MA
+    MERGEMASK VA, MA, S2, VA
+	##
+	LOADMASK [DVA], S3, MA
+	MERGEMASK VA, MA, S3, VA
+	##
+	MADD DVA, 2, DVA
+	STOREALN.Z32 DS12, S17, DS6, VA
+	##
+	//2, 4097+2, 4097*2+2             at cycle 0
+	//10, 4097+10, 4097*2+10          at cycle 1
+	ADD.U32 DS12, DS2, DS12
+	LOADMASK [DVA], S0, MA
+    ADD.U16 MA, 0, VA
+	##
+	LOADMASK [DVA], S1, MA
+    MERGEMASK VA, MA, S1, VA
+	##
+	LOADMASK [DVA], S2, MA
+    MERGEMASK VA, MA, S2, VA
+	##
+	LOADMASK [DVA], S3, MA
+	MERGEMASK VA, MA, S3, VA
+	##
+	MADD DVA, 2, DVA
+	STOREALN.Z32 DS12, S17, DS6, VA
+	##
+	//3, 4097+3, 4097*2+3             at cycle 0
+	//11, 4097+11, 4097*2+11          at cycle 1
+	ADD.U32 DS12, DS2, DS12
+	LOADMASK [DVA], S0, MA
+    ADD.U16 MA, 0, VA
+	##
+	LOADMASK [DVA], S1, MA
+    MERGEMASK VA, MA, S1, VA
+	##
+	LOADMASK [DVA], S2, MA
+    MERGEMASK VA, MA, S2, VA
+	##
+	LOADMASK [DVA], S3, MA
+	MERGEMASK VA, MA, S3, VA
+	##
+	MADD DVA, 2, DVA
+	STOREALN.Z32 DS12, S17, DS6, VA
+	##
+	MOVE.U16 S0, S0
+	##
+	MOVE.U16 S0, S0
+	##
+	MOVE.U16 S0, S0
+	##
+	MOVE.U16 S0, S0
+	##
+	MOVE.U16 S0, S0
+	##
+	MOVE.U16 S0, S0
+	##
+	MOVE.U16 S0, S0
+	##
+	MOVE.U16 S0, S0
+	##
+	MOVE.U16 S0, S0
+	##
+	MOVE.U16 S0, S0
+	##
+	MOVE.U16 S0, S0
+	##
+	MOVE.U16 1, S26
+	SUB.U16 S6, S26, S6
+	ADD.U32 DS12, DS2, DS12
+	MOVE.U32 0, DS5
+	JMPC S6, $LOOP
+	JMPNC S6, $RESET_LOOP_BLOCK
+$RESET_LOOP_BLOCK:
+	MOVE.U16 2, S6
+	LDPARAM.U32 [load_jump_size1], DS5
+	MOVE.U16 1, S26
+	SUB.U16 S18, S26, S18
+	ADD.U32 DS12, DS7, DS12
+	JMPC S18, $LOOP
+	JMPNC S18, $RESET_LOOP_ROW
+$RESET_LOOP_ROW:
+	LDPARAM.U32 [loop_block], DS9
+	LDPARAM.U32 [load_jump_size2], DS5
+	MOVE.U16 1, S26
+	SUB.U16 S16, S26, S16
+	MOVE.U16 2, S6
+	MOVE.U16 64, S26
+	MOVE.U16 0, S27
+	ADD.U32 DS4, DS13, DS4
+	LDPARAM.U32 [output], DS12
+	ADD.U32 DS4, DS12, DS12
+	JMPC S16, $LOOP
+	RET
+.Lfunc_end0:
+	.size	blas_transpose_u16

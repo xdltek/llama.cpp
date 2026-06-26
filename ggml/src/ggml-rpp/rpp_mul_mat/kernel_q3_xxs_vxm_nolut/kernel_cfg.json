@@ -1,0 +1,40 @@
+{
+	"kernel_type": "app",
+	"kernel_num": 5,
+	"kernel_name": [
+		"matrix_mul_q3xxs_super_scale",
+		"matrix_mul_vxM_f16_q3xxs_f16_asym_nolut_opt",
+		"matrix_mul_vxM_q3xxs_nolut_asym_batch",
+		"opt_vector_cvt_f16_f32_opt",
+		"opt_vector_cvt_32_16"
+	],
+	"output_dir": "./",
+	"asm_source_dir": "./",
+	"elf_name": "matmul_q3xxs_vxm_nolut",
+	"is_dummy": false,
+	"matrix_mul_q3xxs_super_scale": {
+		"asm_source": "matrix_mul_q3xxs_super_scale.s",
+		"is_forward": true,
+		"is_compiler": false
+	},
+	"matrix_mul_vxM_f16_q3xxs_f16_asym_nolut_opt": {
+		"asm_source": "matrix_mul_vxM_f16_q3xxs_f16_asym_nolut_opt.s",
+		"is_forward": true,
+		"is_compiler": false
+	},
+	"matrix_mul_vxM_q3xxs_nolut_asym_batch": {
+		"asm_source": "matrix_mul_vxM_q3xxs_nolut_asym_batch.s",
+		"is_forward": true,
+		"is_compiler": false
+	},
+	"opt_vector_cvt_f16_f32_opt": {
+		"asm_source": "opt_vector_cvt_f16_f32_opt.s",
+		"concat_store": false,
+		"is_forward": false
+	},
+	"opt_vector_cvt_32_16": {
+		"asm_source": "opt_vector_cvt_32_16.s",
+		"concat_store": false,
+		"is_forward": true
+	}
+}

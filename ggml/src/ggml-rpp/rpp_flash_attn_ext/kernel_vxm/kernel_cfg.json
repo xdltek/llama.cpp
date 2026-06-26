@@ -1,0 +1,207 @@
+{
+	"kernel_type": "app",
+	"kernel_num": 31,
+	"kernel_name": [
+		"blas_transpose_u16",
+		"blas_trans_padding",
+		"expand_1_matrix_batch_vxM_f16_f16_f32_dyn",
+		"expand_2_matrix_batch_vxM_f16_f16_f32_dyn",
+		"expand_3_matrix_batch_vxM_f16_f16_f32_dyn",
+		"expand_6_matrix_batch_vxM_f16_f16_f32_dyn",
+		"expand_7_matrix_batch_vxM_f16_f16_f32_dyn",
+		"expand_8_matrix_batch_vxM_f16_f16_f32_dyn",
+		"expand_matrix_batch_vxM_f16_f16_f32_dyn",
+		"expand_matrix_batch_hkv_vxM_f16_f16_f32_dyn",
+		"expand_matrix_batch_vxM_group_f16_dyn",
+		"llama3_loop2_mid_add_bc_y_f32_f16_f32",
+		"llama3_loop2_mid_mish_f16",
+		"llama3_loop2_mid_mul_bc_x_f16",
+		"llama3_loop2_mid_reduce_max_f32",
+		"llama3_loop2_mid_reduce_sum_f16",
+		"llama3_loop2_mid_sub_bc_x_f32_f16",
+		"opt_scale_uniform_f16",
+		"opt_reduce_f16",
+		"opt_aln_reduce_f16",
+		"opt_aln_z32_reduce_f16",
+		"opt_gen_reduce_f16",
+		"opt_reduce_f32",
+		"opt_aln_reduce_f32",
+		"opt_aln_z32_reduce_f32",
+		"opt_gen_reduce_f32",
+		"opt_reduce_reciprocal_f16",
+		"opt_aln_reduce_reciprocal_f16",
+		"opt_gen_reduce_reciprocal_f16",
+		"opt_vector_cvt_f16_f32_opt",
+		"opt_vector_cvt_32_16"
+	],
+	"output_dir": "./",
+	"asm_source_dir": "./",
+	"elf_name": "flash_atten_vxm",
+	"is_dummy": false,
+	"blas_transpose_u16": {
+		"asm_source": "blas_transpose_u16.s",
+		"concat_store": false,
+		"is_forward": true
+	},
+	"blas_trans_padding": {
+		"asm_source": "blas_trans_padding.s",
+		"concat_store": false,
+		"is_forward": true
+	},
+	"expand_1_matrix_batch_vxM_f16_f16_f32_dyn": {
+		"asm_source": "expand_1_matrix_batch_vxM_f16_f16_f32_dyn.s",
+		"is_forward": true,
+		"is_compiler": false
+	},
+	"expand_2_matrix_batch_vxM_f16_f16_f32_dyn": {
+		"asm_source": "expand_2_matrix_batch_vxM_f16_f16_f32_dyn.s",
+		"is_forward": true,
+		"is_compiler": false
+	},
+	"expand_3_matrix_batch_vxM_f16_f16_f32_dyn": {
+		"asm_source": "expand_3_matrix_batch_vxM_f16_f16_f32_dyn.s",
+		"is_forward": true,
+		"is_compiler": false
+	},
+	"expand_6_matrix_batch_vxM_f16_f16_f32_dyn": {
+		"asm_source": "expand_6_matrix_batch_vxM_f16_f16_f32_dyn.s",
+		"is_forward": true,
+		"is_compiler": false
+	},
+	"expand_7_matrix_batch_vxM_f16_f16_f32_dyn": {
+		"asm_source": "expand_7_matrix_batch_vxM_f16_f16_f32_dyn.s",
+		"is_forward": true,
+		"is_compiler": false
+	},
+	"expand_8_matrix_batch_vxM_f16_f16_f32_dyn": {
+		"asm_source": "expand_8_matrix_batch_vxM_f16_f16_f32_dyn.s",
+		"is_forward": true,
+		"is_compiler": false
+	},
+	"expand_matrix_batch_vxM_f16_f16_f32_dyn": {
+		"asm_source": "expand_matrix_batch_vxM_f16_f16_f32_dyn.s",
+		"is_forward": true,
+		"is_compiler": false
+	},
+	"expand_matrix_batch_hkv_vxM_f16_f16_f32_dyn": {
+		"asm_source": "expand_matrix_batch_hkv_vxM_f16_f16_f32_dyn.s",
+		"is_forward": true,
+		"is_compiler": false
+	},
+	"expand_matrix_batch_vxM_group_f16_dyn": {
+		"asm_source": "expand_matrix_batch_vxM_group_f16_dyn.s",
+		"is_forward": true,
+		"is_compiler": false
+	},
+	"llama3_loop2_mid_add_bc_y_f32_f16_f32": {
+		"asm_source": "llama3_loop2_mid_add_bc_y_f32_f16_f32.s",
+		"is_forward": true,
+		"is_compiler": false
+	},
+	"llama3_loop2_mid_mish_f16": {
+		"asm_source": "llama3_loop2_mid_mish_f16.s",
+		"is_forward": false,
+		"is_compiler": false
+	},
+	"llama3_loop2_mid_mul_bc_x_f16": {
+		"asm_source": "llama3_loop2_mid_mul_bc_x_f16.s",
+		"is_forward": true,
+		"is_compiler": false
+	},
+	"llama3_loop2_mid_reduce_max_f32": {
+		"asm_source": "llama3_loop2_mid_reduce_max_f32.s",
+		"is_forward": true,
+		"is_compiler": false
+	},
+	"llama3_loop2_mid_reduce_sum_f16": {
+		"asm_source": "llama3_loop2_mid_reduce_sum_f16.s",
+		"is_forward": true,
+		"is_compiler": false
+	},
+	"llama3_loop2_mid_sub_bc_x_f32_f16": {
+		"asm_source": "llama3_loop2_mid_sub_bc_x_f32_f16.s",
+		"is_forward": true,
+		"is_compiler": false
+	},
+	"opt_scale_uniform_f16": {
+		"asm_source": "opt_scale_uniform_f16.s",
+		"concat_store": false,
+		"is_forward": true
+	},
+	"opt_reduce_f16": {
+		"asm_source": "opt_reduce_f16.s",
+		"concat_store": false,
+		"is_forward": true,
+		"is_compiler": false
+	},
+	"opt_aln_reduce_f16": {
+		"asm_source": "opt_aln_reduce_f16.s",
+		"concat_store": false,
+		"is_forward": true,
+		"is_compiler": false
+	},
+	"opt_aln_z32_reduce_f16": {
+		"asm_source": "opt_aln_z32_reduce_f16.s",
+		"concat_store": false,
+		"is_forward": true,
+		"is_compiler": false
+	},
+	"opt_gen_reduce_f16": {
+		"asm_source": "opt_gen_reduce_f16.s",
+		"concat_store": false,
+		"is_forward": true,
+		"is_compiler": false
+	},
+	"opt_reduce_f32": {
+		"asm_source": "opt_reduce_f32.s",
+		"concat_store": false,
+		"is_forward": true,
+		"is_compiler": false
+	},
+	"opt_aln_reduce_f32": {
+		"asm_source": "opt_aln_reduce_f32.s",
+		"concat_store": false,
+		"is_forward": true,
+		"is_compiler": false
+	},
+	"opt_aln_z32_reduce_f32": {
+		"asm_source": "opt_aln_z32_reduce_f32.s",
+		"concat_store": false,
+		"is_forward": true,
+		"is_compiler": false
+	},
+	"opt_gen_reduce_f32": {
+		"asm_source": "opt_gen_reduce_f32.s",
+		"concat_store": false,
+		"is_forward": true,
+		"is_compiler": false
+	},
+	"opt_reduce_reciprocal_f16": {
+		"asm_source": "opt_reduce_reciprocal_f16.s",
+		"concat_store": false,
+		"is_forward": true,
+		"is_compiler": false
+	},
+	"opt_aln_reduce_reciprocal_f16": {
+		"asm_source": "opt_aln_reduce_reciprocal_f16.s",
+		"concat_store": false,
+		"is_forward": true,
+		"is_compiler": false
+	},
+	"opt_gen_reduce_reciprocal_f16": {
+		"asm_source": "opt_gen_reduce_reciprocal_f16.s",
+		"concat_store": false,
+		"is_forward": true,
+		"is_compiler": false
+	},
+	"opt_vector_cvt_f16_f32_opt": {
+		"asm_source": "opt_vector_cvt_f16_f32_opt.s",
+		"concat_store": false,
+		"is_forward": false
+	},
+	"opt_vector_cvt_32_16": {
+		"asm_source": "opt_vector_cvt_32_16.s",
+		"concat_store": false,
+		"is_forward": true
+	}
+}

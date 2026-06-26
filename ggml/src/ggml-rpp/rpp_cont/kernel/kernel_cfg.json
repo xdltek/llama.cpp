@@ -1,0 +1,16 @@
+{
+	"kernel_type": "app",
+	"kernel_num": 1,
+	"kernel_name": [
+		"dma_dyn_d0_2d"
+	],
+	"output_dir": "./",
+	"asm_source_dir": "./",
+	"elf_name": "cont",
+	"is_dummy": false,
+  	"dma_dyn_d0_2d": {
+		"asm_source": "dma_dyn_d0_2d.s",
+		"concat_store": false,
+		"is_forward": false
+	}
+}

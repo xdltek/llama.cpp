@@ -1,0 +1,40 @@
+{
+	"kernel_type": "app",
+	"kernel_num": 5,
+	"kernel_name": [
+		"asym_quant_input_acc",
+		"matrix_mul_q2s_super_scale",
+		"matrix_mul_vxM_f16_q2s_f16_asym_opt",
+		"opt_vector_cvt_f16_f32_opt",
+		"opt_vector_cvt_32_16"
+	],
+	"output_dir": "./",
+	"asm_source_dir": "./",
+	"elf_name": "matmul_q2s_vxm",
+	"is_dummy": false,
+	"asym_quant_input_acc": {
+		"asm_source": "asym_quant_input_acc.s",
+		"is_forward": true,
+		"is_compiler": false
+	},
+	"matrix_mul_q2s_super_scale": {
+		"asm_source": "matrix_mul_q2s_super_scale.s",
+		"is_forward": true,
+		"is_compiler": false
+	},
+	"matrix_mul_vxM_f16_q2s_f16_asym_opt": {
+		"asm_source": "matrix_mul_vxM_f16_q2s_f16_asym_opt.s",
+		"is_forward": true,
+		"is_compiler": false
+	},
+	"opt_vector_cvt_f16_f32_opt": {
+		"asm_source": "opt_vector_cvt_f16_f32_opt.s",
+		"concat_store": false,
+		"is_forward": false
+	},
+	"opt_vector_cvt_32_16": {
+		"asm_source": "opt_vector_cvt_32_16.s",
+		"concat_store": false,
+		"is_forward": true
+	}
+}

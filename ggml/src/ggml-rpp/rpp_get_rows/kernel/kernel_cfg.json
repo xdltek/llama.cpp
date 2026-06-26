@@ -1,0 +1,22 @@
+{
+	"kernel_type": "app",
+	"kernel_num": 2,
+	"kernel_name": [
+		"dma_ddr_to_row_ddr",
+		"dma_ddr_to_row_ddr_non_cont"
+	],
+	"output_dir": "./",
+	"asm_source_dir": "./",
+	"elf_name": "get_rows",
+	"is_dummy": false,
+  	"dma_ddr_to_row_ddr": {
+		"asm_source": "dma_ddr_to_row_ddr.s",
+		"concat_store": false,
+		"is_forward": false
+	},
+  	"dma_ddr_to_row_ddr_non_cont": {
+		"asm_source": "dma_ddr_to_row_ddr_non_cont.s",
+		"concat_store": false,
+		"is_forward": false
+	}
+}

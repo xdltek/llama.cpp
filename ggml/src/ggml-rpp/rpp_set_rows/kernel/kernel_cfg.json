@@ -1,0 +1,46 @@
+{
+	"kernel_type": "app",
+	"kernel_num": 6,
+	"kernel_name": [
+		"dma_row_ddr_to_ddr",
+		"dma_row_ddr_to_sram",
+		"dma_row_sram_to_ddr",
+		"fill_16bits_align",
+		"opt_vector_cvt_f16_f32",
+		"opt_vector_cvt_32_16"
+	],
+	"output_dir": "./",
+	"asm_source_dir": "./",
+	"elf_name": "set_rows",
+	"is_dummy": false,
+  	"dma_row_ddr_to_ddr": {
+		"asm_source": "dma_row_ddr_to_ddr.s",
+		"concat_store": false,
+		"is_forward": false
+	},
+  	"dma_row_ddr_to_sram": {
+		"asm_source": "dma_row_ddr_to_sram.s",
+		"concat_store": false,
+		"is_forward": false
+	},
+  	"dma_row_sram_to_ddr": {
+		"asm_source": "dma_row_sram_to_ddr.s",
+		"concat_store": false,
+		"is_forward": false
+	},
+  	"fill_16bits_align": {
+		"asm_source": "fill_16bits_align.s",
+		"concat_store": false,
+		"is_forward": false
+	},
+	"opt_vector_cvt_f16_f32": {
+		"asm_source": "opt_vector_cvt_f16_f32.s",
+		"concat_store": false,
+		"is_forward": false
+	},
+	"opt_vector_cvt_32_16": {
+		"asm_source": "opt_vector_cvt_32_16.s",
+		"concat_store": false,
+		"is_forward": true
+	}
+}

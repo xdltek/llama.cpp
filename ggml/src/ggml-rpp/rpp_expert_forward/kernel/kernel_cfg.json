@@ -1,0 +1,147 @@
+{
+	"kernel_type": "app",
+	"kernel_num": 22,
+	"kernel_name": [
+		"gather_expert_tokens",
+		"mem_copy_2d_align_f16_f16_all_xy_opt_dyn",
+		"mem_copy_2d_align_f16_f16_all_xy_opt_dyn_v1",
+		"matrix_mul_tn4_f16_f16_dyn",
+		"matrix_mul_tn4_f16_f16_dyn_v1",
+		"matrix_mul_q2s_nolut_super_scale",
+		"matrix_mul_q2s_nolut_asym_opt",
+		"matrix_mul_q2s_nolut_asym_opt_ept32",
+		"matrix_mul_q2xs_super_scale",
+		"matrix_mul_q2xs_nolut_deqaunt_f16",
+		"matrix_mul_q2xs_nolut_deqaunt_f16_ept32",
+		"matrix_mul_q3xxs_super_scale",
+		"matrix_mul_q3xxs_deqaunt_nolut_f16",
+		"llm_gelu_dyn",
+		"llm_split_gelu",
+		"fill_16bits_align",
+		"moe_topk_combine_dyn",
+		"init_expert_id",
+		"dma_expert_params_to_fram",
+		"update_next_expert_id",
+		"opt_vector_cvt_f16_f32_opt",
+		"opt_vector_cvt_32_16"
+	],
+	"output_dir": "./",
+	"asm_source_dir": "./",
+	"elf_name": "matmul_id_fusion",
+	"is_dummy": false,
+	"gather_expert_tokens": {
+		"asm_source": "gather_expert_tokens.s",
+		"concat_store": false,
+		"is_forward": true,
+		"is_compiler": false
+	},
+	"mem_copy_2d_align_f16_f16_all_xy_opt_dyn": {
+		"asm_source": "mem_copy_2d_align_bf16_xy_opt_dyn.s",
+		"concat_store": false,
+		"is_forward": false
+	},
+	"mem_copy_2d_align_f16_f16_all_xy_opt_dyn_v1": {
+		"asm_source": "mem_copy_2d_align_bf16_xy_opt_dyn_v1.s",
+		"concat_store": false,
+		"is_forward": false
+	},
+	"matrix_mul_tn4_f16_f16_dyn": {
+		"asm_source": "matrix_mul_tn4_f16_f16_dyn.s",
+		"concat_store": false,
+		"is_forward": true
+	},
+	"matrix_mul_tn4_f16_f16_dyn_v1": {
+		"asm_source": "matrix_mul_tn4_f16_f16_dyn_v1.s",
+		"concat_store": false,
+		"is_forward": true
+	},
+	"matrix_mul_q2s_nolut_super_scale": {
+		"asm_source": "matrix_mul_q2s_nolut_super_scale.s",
+		"is_forward": true,
+		"is_compiler": false
+	},
+	"matrix_mul_q2s_nolut_asym_opt": {
+		"asm_source": "matrix_mul_q2s_nolut_deqaunt_f16.s",
+		"is_forward": true,
+		"is_compiler": false
+	},
+	"matrix_mul_q2s_nolut_asym_opt_ept32": {
+		"asm_source": "matrix_mul_q2s_nolut_deqaunt_f16_ept32.s",
+		"is_forward": true,
+		"is_compiler": false
+	},
+	"matrix_mul_q2xs_super_scale": {
+		"asm_source": "matrix_mul_q2xs_super_scale.s",
+		"is_forward": true,
+		"is_compiler": false
+	},
+	"matrix_mul_q2xs_nolut_deqaunt_f16": {
+		"asm_source": "matrix_mul_q2xs_nolut_deqaunt_f16.s",
+		"is_forward": true,
+		"is_compiler": false
+	},
+	"matrix_mul_q2xs_nolut_deqaunt_f16_ept32": {
+		"asm_source": "matrix_mul_q2xs_nolut_deqaunt_f16_ept32.s",
+		"is_forward": true,
+		"is_compiler": false
+	},
+	"matrix_mul_q3xxs_super_scale": {
+		"asm_source": "matrix_mul_q3xxs_super_scale.s",
+		"is_forward": true,
+		"is_compiler": false
+	},
+	"matrix_mul_q3xxs_deqaunt_nolut_f16": {
+		"asm_source": "matrix_mul_q3xxs_deqaunt_nolut_f16.s",
+		"is_forward": true,
+		"is_compiler": false
+	},
+	"llm_gelu_dyn": {
+		"asm_source": "llm_gelu_dyn.s",
+		"concat_store": false,
+		"is_forward": true,
+		"is_compiler": false
+	},
+	"llm_split_gelu": {
+		"asm_source": "llm_split_gelu.s",
+		"concat_store": false,
+		"is_forward": true,
+		"is_compiler": false
+	},
+	"fill_16bits_align": {
+		"asm_source": "fill_16bits_align.s",
+		"concat_store": false,
+		"is_forward": false,
+		"is_compiler": false
+	},
+	"moe_topk_combine_dyn": {
+		"asm_source": "moe_topk_combine_dyn.s",
+		"concat_store": false,
+		"is_forward": true,
+		"is_compiler": false
+	},
+	"init_expert_id": {
+		"asm_source": "init_expert_id.s",
+		"concat_store": false,
+		"is_forward": false
+	},
+	"dma_expert_params_to_fram": {
+		"asm_source": "dma_expert_params_to_fram.s",
+		"concat_store": false,
+		"is_forward": false
+	},
+	"update_next_expert_id": {
+		"asm_source": "update_next_expert_id.s",
+		"concat_store": false,
+		"is_forward": false
+	},
+	"opt_vector_cvt_f16_f32_opt": {
+		"asm_source": "opt_vector_cvt_f16_f32_opt.s",
+		"concat_store": false,
+		"is_forward": false
+	},
+	"opt_vector_cvt_32_16": {
+		"asm_source": "opt_vector_cvt_32_16.s",
+		"concat_store": false,
+		"is_forward": true
+	}
+}

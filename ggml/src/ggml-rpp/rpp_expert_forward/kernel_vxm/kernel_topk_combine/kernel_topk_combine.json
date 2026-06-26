@@ -1,0 +1,43 @@
+{
+	"kernel_type": "app",
+	"kernel_num": 2,
+	"kernel_name": [
+		"moe_topk_comb_fp16",
+		"moe_topk_comb_fp32",
+		"fill_16bits_align",
+		"opt_vector_cvt_f16_f32_opt",
+		"opt_vector_cvt_32_16"
+	],
+	"output_dir": "./",
+	"asm_source_dir": "./",
+	"elf_name": "topk_combine",
+	"is_dummy": false,
+	"moe_topk_comb_fp16": {
+		"asm_source": "moe_topk_comb_fp16.s",
+		"concat_store": false,
+		"is_forward": true,
+		"is_compiler": false
+	},
+	"moe_topk_comb_fp32": {
+		"asm_source": "moe_topk_comb_fp32.s",
+		"concat_store": false,
+		"is_forward": true,
+		"is_compiler": false
+	},
+	"fill_16bits_align": {
+		"asm_source": "fill_16bits_align.s",
+		"concat_store": false,
+		"is_forward": false,
+		"is_compiler": false
+	},
+	"opt_vector_cvt_f16_f32_opt": {
+		"asm_source": "opt_vector_cvt_f16_f32_opt.s",
+		"concat_store": false,
+		"is_forward": false
+	},
+	"opt_vector_cvt_32_16": {
+		"asm_source": "opt_vector_cvt_32_16.s",
+		"concat_store": false,
+		"is_forward": true
+	}
+}

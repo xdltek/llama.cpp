@@ -1,0 +1,262 @@
+///< rpp not support, disable code 
+
+一.ggml_backend_rpp_device_interface 相关接口
+static const ggml_backend_device_i ggml_backend_rpp_device_interface = {
+    /* .get_name                = */ ggml_backend_rpp_device_get_name,
+    /* .get_description         = */ ggml_backend_rpp_device_get_description,
+    /* .get_memory              = */ ggml_backend_rpp_device_get_memory,
+    /* .get_type                = */ ggml_backend_rpp_device_get_type,
+    /* .get_props               = */ ggml_backend_rpp_device_get_props,
+    /* .init_backend            = */ ggml_backend_rpp_device_init_backend,
+    /* .get_buffer_type         = */ ggml_backend_rpp_device_get_buffer_type,
+    /* .get_host_buffer_type    = */ ggml_backend_rpp_device_get_host_buffer_type,
+    /* .buffer_from_host_ptr    = */ NULL, //not support for rpp
+    /* .supports_op             = */ ggml_backend_rpp_device_supports_op,
+    /* .supports_buft           = */ ggml_backend_rpp_device_supports_buft,
+    /* .offload_op              = */ ggml_backend_rpp_device_offload_op,
+    /* .event_new               = */ ggml_backend_rpp_device_event_new,
+    /* .event_free              = */ ggml_backend_rpp_device_event_free,
+    /* .event_synchronize       = */ ggml_backend_rpp_device_event_synchronize,
+};
+
+已完成
+static const char * ggml_backend_rpp_device_get_name(ggml_backend_dev_t dev)
+
+static const char* ggml_backend_rpp_device_get_description(ggml_backend_dev_t dev) 
+
+static void ggml_backend_rpp_device_get_memory(ggml_backend_dev_t dev, size_t * free, size_t * total)
+
+static enum ggml_backend_dev_type ggml_backend_rpp_device_get_type(ggml_backend_dev_t dev)
+
+void ggml_rpp_error(const char * stmt, const char * func, const char * file, int line, const char * msg)
+
+
+static ggml_backend_t ggml_backend_rpp_device_init_backend(ggml_backend_dev_t dev, const char * params)
+--> 调用ggml_backend_rpp_init(ctx->device)(方冲)
+
+static bool ggml_backend_rpp_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) 
+--> 调用ggml_rpp_info()(重点实现)，其中ggml_backend_buft_is_rpp、ggml_backend_buft_is_rpp_split和ggml_backend_buft_is_rpp_host获取值比对无需特殊关注
+
+static bool ggml_backend_rpp_device_offload_op(ggml_backend_dev_t dev, const ggml_tensor * op)
+-->调用get_op_batch_size，已完成，该函数功能是指对于维度小(<32)的矩阵在cpu执行，维度很大的矩阵在npu执行，
+
+
+static ggml_backend_event_t ggml_backend_rpp_device_event_new(ggml_backend_dev_t dev)
+
+static void ggml_backend_rpp_device_event_free(ggml_backend_dev_t dev, ggml_backend_event_t event)
+
+static void ggml_backend_rpp_device_event_synchronize(ggml_backend_dev_t dev, ggml_backend_event_t event) 
+
+static bool ggml_backend_buft_is_rpp(ggml_backend_buffer_type_t buft)
+
+static ggml_backend_buffer_type_t ggml_backend_rpp_device_get_buffer_type(ggml_backend_dev_t dev)
+--> 调用ggml_backend_rpp_buffer_type(ctx->device)-->ggml_backend_buffer_type_t ggml_backend_rpp_buffer_type(int device)
+--> 到第二节ggml_backend_rpp_buffer_type_interface 相关接口
+
+static ggml_backend_buffer_type_t ggml_backend_rpp_device_get_host_buffer_type(ggml_backend_dev_t dev)
+--> 调用ggml_backend_rpp_host_buffer_type()
+--> 到第四节 ggml_backend_rpp_buffer_type_host 相关接口
+
+3.未完成：
+ggml_backend_rpp_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) 为完成，主要是ggml_backend_buft_is_rpp_split功能
+
+ggml_rpp_info() --> ggml_rpp_init()重点，未完成
+
+
+二.ggml_backend_rpp_buffer_type_interface 相关接口
+static const ggml_backend_buffer_type_i ggml_backend_rpp_buffer_type_interface = {
+    /* .get_name         = */ ggml_backend_rpp_buffer_type_get_name,
+    /* .alloc_buffer     = */ ggml_backend_rpp_buffer_type_alloc_buffer,
+    /* .get_alignment    = */ ggml_backend_rpp_buffer_type_get_alignment,
+    /* .get_max_size     = */ NULL, // defaults to SIZE_MAX
+    /* .get_alloc_size   = */ ggml_backend_rpp_buffer_type_get_alloc_size,
+    /* .is_host          = */ NULL,
+};
+
+1.已完成：
+
+直接接口
+static const char * ggml_backend_rpp_buffer_type_get_name(ggml_backend_buffer_type_t buft)
+
+static size_t ggml_backend_rpp_buffer_type_get_alignment(ggml_backend_buffer_type_t buft) 
+
+static size_t ggml_backend_rpp_buffer_type_get_alloc_size(ggml_backend_buffer_type_t buft, const ggml_tensor * tensor)
+
+static ggml_backend_buffer_t ggml_backend_rpp_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size)
+--> 接口内会构建ggml_backend_rpp_buffer_interface，
+--> 到第三节 ggml_backend_rpp_buffer_interface 相关接口
+
+间接相关
+static rtError_t ggml_rpp_device_malloc(void ** ptr, size_t size, int device)
+
+2.未完成：
+
+
+三.ggml_backend_rpp_buffer_interface 接口
+static const ggml_backend_buffer_i ggml_backend_rpp_buffer_interface = {
+    /* .free_buffer     = */ ggml_backend_rpp_buffer_free_buffer,
+    /* .get_base        = */ ggml_backend_rpp_buffer_get_base,
+    /* .init_tensor     = */ ggml_backend_rpp_buffer_init_tensor,
+    /* .memset_tensor   = */ ggml_backend_rpp_buffer_memset_tensor,
+    /* .set_tensor      = */ ggml_backend_rpp_buffer_set_tensor,
+    /* .get_tensor      = */ ggml_backend_rpp_buffer_get_tensor,
+    /* .cpy_tensor      = */ ggml_backend_rpp_buffer_cpy_tensor,
+    /* .clear           = */ ggml_backend_rpp_buffer_clear,
+    /* .reset           = */ NULL,
+};
+
+1.已完成:
+直接接口
+static void ggml_backend_rpp_buffer_free_buffer(ggml_backend_buffer_t buffer)
+
+static void * ggml_backend_rpp_buffer_get_base(ggml_backend_buffer_t buffer)
+
+static enum ggml_status ggml_backend_rpp_buffer_init_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor)
+
+static void ggml_backend_rpp_buffer_memset_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, uint8_t value, size_t offset, size_t size)
+->接口内部的rtStreamPerThread我们暂时没有,用#define rtStreamPerThread (rtStream_t)0替代
+
+static void ggml_backend_rpp_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size)
+->接口内部的rtStreamPerThread我们暂时没有，用#define rtStreamPerThread (rtStream_t)0替代
+
+static void ggml_backend_rpp_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset, size_t size)
+->接口内部的rtStreamPerThread我们暂时没有，用#define rtStreamPerThread (rtStream_t)0替代
+
+static void ggml_backend_rpp_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value)
+->接口内部的rtStreamPerThread我们暂时没有，用#define rtStreamPerThread (rtStream_t)0替代
+
+
+四. ggml_backend_rpp_buffer_type_host 相关接口
+static struct ggml_backend_buffer_type ggml_backend_rpp_buffer_type_host = {
+        /* .iface    = */ {
+            /* .get_name         = */ ggml_backend_rpp_host_buffer_type_name,
+            /* .alloc_buffer     = */ ggml_backend_rpp_host_buffer_type_alloc_buffer,
+            /* .get_alignment    = */ ggml_backend_cpu_buffer_type()->iface.get_alignment,
+            /* .get_max_size     = */ NULL, // defaults to SIZE_MAX
+            /* .get_alloc_size   = */ ggml_backend_cpu_buffer_type()->iface.get_alloc_size,
+            /* .is_host          = */ ggml_backend_cpu_buffer_type()->iface.is_host,
+        },
+        /* .device   = */ ggml_backend_reg_dev_get(ggml_backend_rpp_reg(), 0),
+        /* .context  = */ nullptr,
+    };
+1.已完成：
+直接接口
+static const char * ggml_backend_rpp_host_buffer_type_name(ggml_backend_buffer_type_t buft)
+
+static ggml_backend_buffer_t ggml_backend_rpp_host_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size)
+    ggml_rpp_host_malloc()
+    ggml_backend_rpp_host_buffer_free_buffer()
+
+
+五. ggml_backend_rpp_interface 接口函数
+static const ggml_backend_i ggml_backend_rpp_interface = {
+    /* .get_name                = */ ggml_backend_rpp_get_name,
+    /* .free                    = */ ggml_backend_rpp_free,
+    /* .set_tensor_async        = */ ggml_backend_rpp_set_tensor_async,
+    /* .get_tensor_async        = */ ggml_backend_rpp_get_tensor_async,
+    /* .cpy_tensor_async        = */ ggml_backend_rpp_cpy_tensor_async,
+    /* .synchronize             = */ ggml_backend_rpp_synchronize,
+    /* .graph_plan_create       = */ NULL,
+    /* .graph_plan_free         = */ NULL,
+    /* .graph_plan_update       = */ NULL,
+    /* .graph_plan_compute      = */ NULL,
+    /* .graph_compute           = */ ggml_backend_rpp_graph_compute,
+    /* .event_record            = */ ggml_backend_rpp_event_record,
+    /* .event_wait              = */ ggml_backend_rpp_event_wait,
+};
+
+1.已完成：
+static const char * ggml_backend_rpp_get_name(ggml_backend_t backend)
+
+static void ggml_backend_rpp_free(ggml_backend_t backend)
+
+static void ggml_backend_rpp_set_tensor_async(ggml_backend_t backend, ggml_tensor * tensor, const void * data, size_t offset, size_t size) 
+
+static void ggml_backend_rpp_get_tensor_async(ggml_backend_t backend, const ggml_tensor * tensor, void * data, size_t offset, size_t size) 
+
+static bool ggml_backend_rpp_cpy_tensor_async(ggml_backend_t backend_src, ggml_backend_t backend_dst, const ggml_tensor * src, ggml_tensor * dst)
+
+static void ggml_backend_rpp_synchronize(ggml_backend_t backend)
+
+2.未完成：
+
+static enum ggml_status ggml_backend_rpp_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph)
+
+
+六.未使用
+1.register中的获取进程地址函数，目前参考华为，已经直接返回nullptr，下面是nvidia的实现
+static void * ggml_backend_rpp_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
+    GGML_UNUSED(reg);
+    if (strcmp(name, "ggml_backend_split_buffer_type") == 0) {
+        return (void *)ggml_backend_rpp_split_buffer_type;
+    }
+    if (strcmp(name, "ggml_backend_register_host_buffer") == 0) {
+        return (void *)ggml_backend_rpp_register_host_buffer;
+    }
+    if (strcmp(name, "ggml_backend_unregister_host_buffer") == 0) {
+        return (void *)ggml_backend_rpp_unregister_host_buffer;
+    }
+    if (strcmp(name, "ggml_backend_get_features") == 0) {
+        return (void *)ggml_backend_rpp_get_features;
+    }
+    return nullptr;
+}
+
+2.ggml_backend_rpp_split_buffer_type_interface 接口 （未使用）
+static const ggml_backend_buffer_type_i ggml_backend_rpp_split_buffer_type_interface = {
+    /* .get_name         = */ ggml_backend_rpp_split_buffer_type_get_name,
+    /* .alloc_buffer     = */ ggml_backend_rpp_split_buffer_type_alloc_buffer,
+    /* .get_alignment    = */ ggml_backend_rpp_split_buffer_type_get_alignment,
+    /* .get_max_size     = */ NULL, // defaults to SIZE_MAX
+    /* .get_alloc_size   = */ ggml_backend_rpp_split_buffer_type_get_alloc_size,
+    /* .is_host          = */ ggml_backend_rpp_split_buffer_type_is_host,
+};
+(1)已完成
+static const char * ggml_backend_rpp_split_buffer_type_get_name(ggml_backend_buffer_type_t buft) 
+
+static ggml_backend_buffer_t ggml_backend_rpp_split_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) 
+--> 接口内构建ggml_backend_rpp_split_buffer_interface， 节下一节3
+
+static size_t ggml_backend_rpp_split_buffer_type_get_alignment(ggml_backend_buffer_type_t buft)
+
+static size_t ggml_backend_rpp_split_buffer_type_get_alloc_size(ggml_backend_buffer_type_t buft, const ggml_tensor * tensor)
+
+static bool ggml_backend_rpp_split_buffer_type_is_host(ggml_backend_buffer_type_t buft) 
+
+3.ggml_backend_rpp_split_buffer_interface 接口 （未使用）
+static const ggml_backend_buffer_i ggml_backend_rpp_split_buffer_interface = {
+    /* .free_buffer     = */ ggml_backend_rpp_split_buffer_free_buffer,
+    /* .get_base        = */ ggml_backend_rpp_split_buffer_get_base,
+    /* .init_tensor     = */ ggml_backend_rpp_split_buffer_init_tensor,
+    /* .memset_tensor   = */ NULL,
+    /* .set_tensor      = */ ggml_backend_rpp_split_buffer_set_tensor,
+    /* .get_tensor      = */ ggml_backend_rpp_split_buffer_get_tensor,
+    /* .cpy_tensor      = */ NULL,
+    /* .clear           = */ ggml_backend_rpp_split_buffer_clear,
+    /* .reset           = */ NULL,
+};
+
+(1) 已完成：
+static void ggml_backend_rpp_split_buffer_free_buffer(ggml_backend_buffer_t buffer) 
+
+static void * ggml_backend_rpp_split_buffer_get_base(ggml_backend_buffer_t buffer) 
+
+static enum ggml_status ggml_backend_rpp_split_buffer_init_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor) 
+
+static void ggml_backend_rpp_split_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size)
+
+static void ggml_backend_rpp_split_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset, size_t size)
+
+static void ggml_backend_rpp_split_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) 
+
+
+
+七.源码修改
+文件：llama-context.cpp：141行
+ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr)修改为ggml_backend_t backend = ggml_backend_dev_init(dev, (const char*)this);
+
+
+八.rope的sin/cos问题：
+目前sin_cache/cos_cache是依托 ggml_backend_rpp_context 绑定的，会导致一个 ggml_backend_rpp_context 只能初始化一次，导致多次启动不同的shape的ut测试失败，另外ggml_backend_rpp_context的
+类型是static的，会导致只能构建一次，如果多个模型加载会导致只构建一个context，和nvidia不同
+

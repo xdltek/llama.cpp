@@ -1,0 +1,50 @@
+{
+	"kernel_type": "app",
+	"kernel_num": 6,
+	"kernel_name": [
+		"llama3_loop1_pat0_fuse",
+		"rope_mode2_gen_fuse",
+		"rope_mode2_align_fuse",
+		"mem_copy_2d_align_bf16_yz_opt",
+		"opt_vector_cvt_f16_f32_opt",
+		"opt_vector_cvt_32_16"
+	],
+	"output_dir": "./",
+	"asm_source_dir": "./",
+	"elf_name": "rope",
+	"is_dummy": false,
+	"llama3_loop1_pat0_fuse": {
+		"asm_source": "llama3_loop1_pat0_fuse.s",
+		"concat_store": false,
+		"is_forward": true,
+		"is_compiler": false
+	},
+	"rope_mode2_gen_fuse": {
+		"asm_source": "rope_mode2_gen_fuse.s",
+		"concat_store": false,
+		"is_forward": true,
+		"is_compiler": false
+	},
+	"mem_copy_2d_align_bf16_yz_opt": {
+		"asm_source": "mem_copy_2d_align_bf16_yz_opt.s",
+		"concat_store": false,
+		"is_forward": false,
+		"is_compiler": false
+	},
+	"rope_mode2_align_fuse": {
+		"asm_source": "rope_mode2_align_fuse.s",
+		"concat_store": false,
+		"is_forward": true,
+		"is_compiler": false
+	},
+	"opt_vector_cvt_f16_f32_opt": {
+		"asm_source": "opt_vector_cvt_f16_f32_opt.s",
+		"concat_store": false,
+		"is_forward": false
+	},
+	"opt_vector_cvt_32_16": {
+		"asm_source": "opt_vector_cvt_32_16.s",
+		"concat_store": false,
+		"is_forward": true
+	}
+}

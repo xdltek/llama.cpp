@@ -1,0 +1,64 @@
+{
+	"kernel_type": "app",
+	"kernel_num": 9,
+	"kernel_name": [
+		"matmul_tn1_f16_f32_f16",
+		"matmul_tn2_f16_f32_f16",
+		"matmul_tn3_f16_f32_f16",
+		"matmul_tn4_f16_f32_f16",
+		"matrix_mul_q2xs_deqaunt_f16",
+		"matrix_mul_q2xs_super_scale",
+		"mem_copy_2d_align_f16_f16_all_xy_opt",
+		"opt_vector_cvt_f16_f32_opt",
+		"opt_vector_cvt_32_16"
+	],
+	"output_dir": "./",
+	"asm_source_dir": "./",
+	"elf_name": "matmul_q2xs",
+	"is_dummy": false,
+	"matmul_tn1_f16_f32_f16": {
+		"asm_source": "matrix_mul_tn1_f16_f16.s",
+		"concat_store": false,
+		"is_forward": true
+	},
+	"matmul_tn2_f16_f32_f16": {
+		"asm_source": "matrix_mul_tn2_f16_f16.s",
+		"concat_store": false,
+		"is_forward": true
+	},
+	"matmul_tn3_f16_f32_f16": {
+		"asm_source": "matrix_mul_tn3_f16_f16.s",
+		"concat_store": false,
+		"is_forward": true
+	},
+	"matmul_tn4_f16_f32_f16": {
+		"asm_source": "matrix_mul_tn4_f16_f16.s",
+		"concat_store": false,
+		"is_forward": true
+	},
+	"matrix_mul_q2xs_deqaunt_f16": {
+		"asm_source": "matrix_mul_q2xs_deqaunt_f16.s",
+		"is_forward": true,
+		"is_compiler": false
+	},
+	"matrix_mul_q2xs_super_scale": {
+		"asm_source": "matrix_mul_q2xs_super_scale.s",
+		"is_forward": true,
+		"is_compiler": false
+	},
+	"mem_copy_2d_align_f16_f16_all_xy_opt": {
+		"asm_source": "mem_copy_2d_align_bf16_xy_opt.s",
+		"concat_store": false,
+		"is_forward": false
+	},
+	"opt_vector_cvt_f16_f32_opt": {
+		"asm_source": "opt_vector_cvt_f16_f32_opt.s",
+		"concat_store": false,
+		"is_forward": false
+	},
+	"opt_vector_cvt_32_16": {
+		"asm_source": "opt_vector_cvt_32_16.s",
+		"concat_store": false,
+		"is_forward": true
+	}
+}

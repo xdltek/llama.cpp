@@ -1,0 +1,58 @@
+{
+	"kernel_type": "app",
+	"kernel_num": 7,
+	"kernel_name": [
+		"ap_f16_f32_f16_hwc32",
+		"opt_chw2hwc32_16b",
+		"hwc322hwc128_f16_f32_f16_all",
+		"hwc322chw_f16_f32_f16_all_opt1",
+		"opt_vector_cvt_f16_f32_v2",
+		"opt_vector_cvt_32_16",
+		"chw2hwc32_f16_f32_f16_all",
+		"hwc322chw_f16_f32_f16_all"
+	],
+	"output_dir": "./",
+	"asm_source_dir": "./",
+	"elf_name": "pool_2d",
+	"is_dummy": false,
+	"ap_f16_f32_f16_hwc32": {
+		"asm_source": "opt_ap_fast_flp16.s",
+		"concat_store": false,
+		"is_forward": true
+	},
+	"opt_chw2hwc32_16b": {
+		"asm_source": "opt_chw2hwc32_16bits.s",
+		"concat_store": false,
+		"is_forward": true
+	},
+	"hwc322hwc128_f16_f32_f16_all": {
+		"asm_source": "hwc322hwc128_bf16.s",
+		"concat_store": false,
+		"is_forward": true
+	},
+	"hwc322chw_f16_f32_f16_all_opt1": {
+		"asm_source": "hwc322chw_bf16_opt1.s",
+		"concat_store": false,
+		"is_forward": true
+	},
+	"chw2hwc32_f16_f32_f16_all": {
+		"asm_source": "chw2hwc32_bf16.s",
+		"concat_store": false,
+		"is_forward": true
+	},
+	"hwc322chw_f16_f32_f16_all": {
+		"asm_source": "hwc322chw_bf16.s",
+		"concat_store": false,
+		"is_forward": true
+	},
+	"opt_vector_cvt_f16_f32_v2": {
+		"asm_source": "opt_vector_cvt_f16_f32_v2.s",
+		"concat_store": false,
+		"is_forward": false
+	},
+	"opt_vector_cvt_32_16": {
+		"asm_source": "opt_vector_cvt_32_16.s",
+		"concat_store": false,
+		"is_forward": true
+	}
+}
