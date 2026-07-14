@@ -35,7 +35,7 @@ llama.cpp server 模式包含 Web UI 前端资源。
 node -v
 ```
 
-如果未安装 Node.js 22，根据一下步骤修复
+如果未安装 Node.js 22，根据以下步骤修复：
 
 #### 3.1 安装 Node.js 22
 
