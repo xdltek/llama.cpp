@@ -153,6 +153,10 @@ POST /v1/chat/completions
 
 ---
 
+#  FAQ
+
+\- [llama-server Web UI not display](/FAQ/server-ui-not-display.md)
+
 # Original llama.cpp Documentation
 
 The following sections are preserved from the upstream llama.cpp project and remain fully applicable to the AzurEngine RPP backend.
@@ -368,7 +372,7 @@ Instructions for adding support for new models: [HOWTO-add-model.md](docs/develo
 - [llmaz](https://github.com/InftyAI/llmaz) - ☸️ Easy, advanced inference platform for large language models on Kubernetes.
 - [LLMKube](https://github.com/defilantech/llmkube) - Kubernetes operator for llama.cpp with multi-GPU and Apple Silicon Metal
   support"
-</details>
+  </details>
 
 <details>
 <summary>Games</summary>
@@ -439,7 +443,7 @@ To learn more about model quantization, [read this documentation](tools/quantize
 
     ```bash
     llama-cli -m model.gguf
-
+    
     # > hi, who are you?
     # Hi there! I'm your helpful assistant! I'm an AI-powered chatbot designed to assist and provide information to users like you. I'm here to help answer your questions, provide guidance, and offer support on a wide range of topics. I'm a friendly and knowledgeable AI, and I'm always happy to help with anything you need. What's on your mind, and how can I assist you today?
     #
@@ -455,7 +459,7 @@ To learn more about model quantization, [read this documentation](tools/quantize
     ```bash
     # use the "chatml" template (use -h to see the list of supported templates)
     llama-cli -m model.gguf -cnv --chat-template chatml
-
+    
     # use a custom template
     llama-cli -m model.gguf -cnv --in-prefix 'User: ' --reverse-prompt 'User:'
     ```
@@ -467,7 +471,7 @@ To learn more about model quantization, [read this documentation](tools/quantize
 
     ```bash
     llama-cli -m model.gguf -n 256 --grammar-file grammars/json.gbnf -p 'Request: schedule a call at 8pm; Command:'
-
+    
     # {"appointmentTime": "8pm", "appointmentDetails": "schedule a a call"}
     ```
 
@@ -487,7 +491,7 @@ To learn more about model quantization, [read this documentation](tools/quantize
 
     ```bash
     llama-server -m model.gguf --port 8080
-
+    
     # Basic web UI can be accessed via browser: http://localhost:8080
     # Chat completion endpoint: http://localhost:8080/v1/chat/completions
     ```
@@ -540,7 +544,7 @@ To learn more about model quantization, [read this documentation](tools/quantize
     ```bash
     # custom grammar
     llama-server -m model.gguf --grammar-file grammar.gbnf
-
+    
     # JSON
     llama-server -m model.gguf --grammar-file grammars/json.gbnf
     ```
@@ -557,7 +561,7 @@ To learn more about model quantization, [read this documentation](tools/quantize
 
     ```bash
     llama-perplexity -m model.gguf -f file.txt
-
+    
     # [1]15.2701,[2]5.4007,[3]5.3073,[4]6.2965,[5]5.8940,[6]5.6096,[7]5.7942,[8]4.9297, ...
     # Final estimate: PPL = 5.4007 +/- 0.67339
     ```
@@ -584,7 +588,7 @@ To learn more about model quantization, [read this documentation](tools/quantize
 
     ```bash
     llama-bench -m model.gguf
-
+    
     # Output:
     # | model               |       size |     params | backend    | threads |          test |                  t/s |
     # | ------------------- | ---------: | ---------: | ---------- | ------: | ------------: | -------------------: |
@@ -605,7 +609,7 @@ To learn more about model quantization, [read this documentation](tools/quantize
 
     ```bash
     llama-simple -m model.gguf
-
+    
     # Hello my name is Kaitlyn and I am a 16 year old girl. I am a junior in high school and I am currently taking a class called "The Art of
     ```
 
