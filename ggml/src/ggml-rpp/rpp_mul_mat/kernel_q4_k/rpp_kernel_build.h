@@ -203,7 +203,7 @@ static void rpp_matmul_q4k_tiled(rpp_kernel_context & ctx,
     }
 
     rppStreamBeginCapture(ctx.kernelStream, RPP_STREAM_CAPTURE_MODE_GLOBAL);
-    rppModuleLoad(&ctx.rppBinMod, "rpp_kernel/matmul_q4k.o");
+    rpp_module_load_once(ctx.rppBinMod, "rpp_kernel/matmul_q4k.o");
 
     const int sizeA0 = Mtile * K * in_bytes_per_element;
     const int sizeA1 = Mtile * K * (int) sizeof(rpp::bfloat16);
@@ -356,8 +356,9 @@ static void rpp_matmul_q4k_tiled(rpp_kernel_context & ctx,
     }
 
     rppStreamEndCapture(ctx.kernelStream, &ctx.graph);
-    if (is_instantial) {
-        rppGraphInstantiate(&ctx.graphexec, ctx.graph, NULL, NULL, 0);
+    const std::string graph_key = rpp_join_function_name_and_args(__func__, M, K, N, weights_group, in_bytes_per_element, out_bytes_per_element);
+    if (rpp_graph_instantiate(ctx.graphexec, ctx.graph, graph_key.c_str(), is_instantial) != RPP_SUCCESS) {
+        throw std::runtime_error("rpp_graph_instantiate failed.");
     }
 }
 
@@ -398,7 +399,7 @@ static void rpp_matmul_q4k(rpp_kernel_context & ctx,
     RPPdeviceptr devC             = ctx.dev_out[0];
 
     rppStreamBeginCapture(ctx.kernelStream, RPP_STREAM_CAPTURE_MODE_GLOBAL);
-    rppModuleLoad(&ctx.rppBinMod, "rpp_kernel/matmul_q4k.o");
+    rpp_module_load_once(ctx.rppBinMod, "rpp_kernel/matmul_q4k.o");
 
     const int sizeA0 = M * K * in_bytes_per_element;
     const int sizeA1 = M * K * (int) sizeof(rpp::bfloat16);
@@ -574,8 +575,9 @@ static void rpp_matmul_q4k(rpp_kernel_context & ctx,
     }
 
     rppStreamEndCapture(ctx.kernelStream, &ctx.graph);
-    if (is_instantial) {
-        rppGraphInstantiate(&ctx.graphexec, ctx.graph, NULL, NULL, 0);
+    const std::string graph_key = rpp_join_function_name_and_args(__func__, M, K, N, weights_group, in_bytes_per_element, out_bytes_per_element);
+    if (rpp_graph_instantiate(ctx.graphexec, ctx.graph, graph_key.c_str(), is_instantial) != RPP_SUCCESS) {
+        throw std::runtime_error("rpp_graph_instantiate failed.");
     }
 }
 
@@ -609,7 +611,7 @@ static void rpp_matmul_q4k_pipeline(rpp_kernel_context & ctx,
     RPPdeviceptr devC             = ctx.dev_out[0];
 
     rppStreamBeginCapture(ctx.kernelStream, RPP_STREAM_CAPTURE_MODE_GLOBAL);
-    rppModuleLoad(&ctx.rppBinMod, "rpp_kernel/matmul_q4k.o");
+    rpp_module_load_once(ctx.rppBinMod, "rpp_kernel/matmul_q4k.o");
 
     const int sizeA0           = M * K * in_bytes_per_element;
     const int sizeA1           = M * K * (int) sizeof(rpp::bfloat16);
@@ -852,8 +854,9 @@ static void rpp_matmul_q4k_pipeline(rpp_kernel_context & ctx,
     }
 
     rppStreamEndCapture(ctx.kernelStream, &ctx.graph);
-    if (is_instantial) {
-        rppGraphInstantiate(&ctx.graphexec, ctx.graph, NULL, NULL, 0);
+    const std::string graph_key = rpp_join_function_name_and_args(__func__, M, K, N, weights_group, in_bytes_per_element, out_bytes_per_element);
+    if (rpp_graph_instantiate(ctx.graphexec, ctx.graph, graph_key.c_str(), is_instantial) != RPP_SUCCESS) {
+        throw std::runtime_error("rpp_graph_instantiate failed.");
     }
 }
 

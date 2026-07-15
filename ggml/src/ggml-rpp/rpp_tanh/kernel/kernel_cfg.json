@@ -1,0 +1,28 @@
+{
+	"kernel_type": "app",
+	"kernel_num": 3,
+	"kernel_name": [
+		"mish_f16_f32_f16_all",
+		"opt_vector_cvt_32_16",
+		"opt_vector_cvt_f16_f32_opt"
+	],
+	"output_dir": "./",
+	"asm_source_dir": "./",
+	"elf_name": "tanh",
+	"is_dummy": false,
+	"mish_f16_f32_f16_all": {
+		"asm_source": "mish_bf16.s",
+		"concat_store": false,
+		"is_forward": false
+	},
+	"opt_vector_cvt_32_16": {
+		"asm_source": "opt_vector_cvt_32_16.s",
+		"concat_store": false,
+		"is_forward": true
+	},
+	"opt_vector_cvt_f16_f32_opt": {
+		"asm_source": "opt_vector_cvt_f16_f32_opt.s",
+		"concat_store": false,
+		"is_forward": false
+	}
+}

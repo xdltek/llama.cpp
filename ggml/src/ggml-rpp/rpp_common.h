@@ -94,17 +94,18 @@
 //because of not support thread, so user 0
 #define rtStreamPerThread (rtStream_t) 0
 
-#if GGML_RPP_PERF_TRACE
-#    include "rpp_perf.h"
+#ifndef TRACE_SCOPE_GUARD
+#    if GGML_RPP_PERF_TRACE
+#        include "rpp_perf.h"
 //! use as:
 //! {
 //!     TRACE_SCOPE_GUARD(win, "name");
 //!     // ...
 //! }
 //! It emits TRACE_SCOPE_GUARD at scope entry and TRACE_SCOPE_END at scope exit.
-#    define _RPP_TRACE_CONCAT_INNER(a, b) a##b
-#    define _RPP_TRACE_CONCAT(a, b)       _RPP_TRACE_CONCAT_INNER(a, b)
-#    ifdef __cplusplus
+#        define _RPP_TRACE_CONCAT_INNER(a, b) a##b
+#        define _RPP_TRACE_CONCAT(a, b)       _RPP_TRACE_CONCAT_INNER(a, b)
+#        ifdef __cplusplus
 struct _rpp_trace_scope_guard_t {
     uint32_t     win;
     const char * name;
@@ -117,15 +118,17 @@ struct _rpp_trace_scope_guard_t {
     _rpp_trace_scope_guard_t & operator=(const _rpp_trace_scope_guard_t &) = delete;
 };
 
-#        define TRACE_SCOPE_GUARD(win, name) \
+#            define TRACE_SCOPE_GUARD(win, name) \
             _rpp_trace_scope_guard_t _RPP_TRACE_CONCAT(_rpp_trace_scope_guard_, __LINE__)((uint32_t) (win), (name))
+#        else
+#            define TRACE_SCOPE_GUARD(win, name) TRACE_SCOPE_GUARD((win), (name))
+#        endif
 #    else
-#        define TRACE_SCOPE_GUARD(win, name) TRACE_SCOPE_GUARD((win), (name))
+#        define TRACE_SCOPE_GUARD(win, name) 0
 #    endif
-
-#else
-#    define TRACE_SCOPE_GUARD(win, name) 0
 #endif
+
+extern thread_local uint32_t ggml_rpp_trace_id_current;
 
 [[noreturn]] void ggml_rpp_error(const char * stmt, const char * func, const char * file, int line, const char * msg);
 
@@ -434,9 +437,13 @@ struct rpp_node_kernel : public ggml_rpp_node {
                                     const RPPgraphNode * dependencies    = nullptr,
                                     size_t               numDependencies = 0) {
         GGML_ASSERT(hGraph);
-        GGML_ASSERT(kernel_ctx->graph);
-        RPP_CHECK(rppGraphAddChildGraphNode(&(kernel_ctx->graph_node), hGraph, dependencies, numDependencies,
-                                            kernel_ctx->graph));
+        // Child graphs are instantiated (and their RPPgraph freed) before being
+        // embedded; parent must reference graphexec, not the destroyed graph.
+        GGML_ASSERT(kernel_ctx->graphexec);
+        // RPP_CHECK(rppGraphAddChildGraphNode(&(kernel_ctx->graph_node), hGraph, dependencies, numDependencies,
+        //                                     kernel_ctx->graph));
+        RPP_CHECK(rppGraphAddChildGraphexecNode(&(kernel_ctx->graph_node), hGraph, dependencies, numDependencies,
+                                            kernel_ctx->graphexec));
     }
 
     ~rpp_node_kernel() {
@@ -547,7 +554,7 @@ struct ggml_backend_rpp_context {
     uint32_t           n_max_ctx{ 8192 };
     uint32_t           trace_id{ 0 };
     uint64_t           trace_num{ 0 };  // trace number, used for trace enable and disable
-    uint32_t           stub_kv_step{ 8 };
+    uint32_t           stub_kv_step{ 0 };
 
     rtStream_t streams[GGML_RPP_MAX_DEVICES][GGML_RPP_MAX_STREAMS] = { { nullptr } };
 
@@ -560,6 +567,11 @@ struct ggml_backend_rpp_context {
 
     void * sin_cache{ nullptr };
     void * cos_cache{ nullptr };
+    int64_t rope_cache_D{ 0 };
+    size_t  rope_cache_type_size{ 0 };
+    void * k_shift_sin_cache{ nullptr };
+    void * k_shift_cos_cache{ nullptr };
+    size_t k_shift_cache_size{ 0 };
 
     explicit ggml_backend_rpp_context(int device, const char * params) :
         device(device),

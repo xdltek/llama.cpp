@@ -120,9 +120,13 @@ struct rpp_kernel_rope : public rpp_node_kernel {
 
     ~rpp_kernel_rope() {
         if (!ori_rpp_node && ggml_sin && ggml_cos) {
-            rtFree(ggml_sin->data);
+            if (!is_k_shift) {
+                rtFree(ggml_sin->data);
+            }
             ggml_sin->data = nullptr;
-            rtFree(ggml_cos->data);
+            if (!is_k_shift) {
+                rtFree(ggml_cos->data);
+            }
             ggml_cos->data = nullptr;
             rtFreeHost(sin_data);
             ggml_sin->data = sin_data = nullptr;
@@ -141,12 +145,17 @@ struct rpp_kernel_rope : public rpp_node_kernel {
         }
     }
 
-    void init_sincos_tensors() {
+    void init_sincos_tensors(void * sin_device_data = nullptr, void * cos_device_data = nullptr) {
+        const bool use_external_device_tables = sin_device_data != nullptr || cos_device_data != nullptr;
+        int64_t table_seq_len = cur_ggml_tensor->ne[2];
+        if (!use_external_device_tables && n_ubatch != 1) {
+            table_seq_len = n_ubatch;
+        }
         // create sin
         ggml_sin        = std::make_shared<ggml_tensor>();
         ggml_sin->ne[0] = cur_ggml_tensor->ne[0];
         // this dim is seq len,  for padding
-        ggml_sin->ne[1] = n_ubatch == 1 ? cur_ggml_tensor->ne[2] : n_ubatch;
+        ggml_sin->ne[1] = table_seq_len;
         ggml_sin->ne[2] = cur_ggml_tensor->ne[3];
         ggml_sin->ne[3] = 1;
         ggml_sin->type  = cur_ggml_tensor->src[0]->type;
@@ -158,15 +167,18 @@ struct rpp_kernel_rope : public rpp_node_kernel {
         ggml_sin->nb[2]      = ggml_sin->nb[1] * ggml_sin->ne[1];
         ggml_sin->nb[3]      = ggml_sin->nb[2] * ggml_sin->ne[2];
 
-        rtMallocHost(&sin_data, ggml_nelements(ggml_sin.get()) * ggml_type_size(ggml_sin->type));
-        ggml_sin->data = nullptr;
-        RPP_CHECK(rtMalloc(&(ggml_sin->data), ggml_nelements(ggml_sin.get()) * ggml_type_size(ggml_sin->type)));
+        const size_t host_type_size_sin = type_size_sin < sizeof(float) ? sizeof(float) : type_size_sin;
+        rtMallocHost(&sin_data, ggml_nelements(ggml_sin.get()) * host_type_size_sin);
+        ggml_sin->data = sin_device_data;
+        if (!ggml_sin->data) {
+            RPP_CHECK(rtMalloc(&(ggml_sin->data), ggml_nelements(ggml_sin.get()) * ggml_type_size(ggml_sin->type)));
+        }
 
         // create cos
         ggml_cos        = std::make_shared<ggml_tensor>();
         ggml_cos->ne[0] = cur_ggml_tensor->ne[0];
         // this dim is seq len,  for padding
-        ggml_cos->ne[1] = n_ubatch == 1 ? cur_ggml_tensor->ne[2] : n_ubatch;
+        ggml_cos->ne[1] = table_seq_len;
         ggml_cos->ne[2] = cur_ggml_tensor->ne[3];
         ggml_cos->ne[3] = 1;
         ggml_cos->type  = cur_ggml_tensor->src[0]->type;
@@ -178,9 +190,12 @@ struct rpp_kernel_rope : public rpp_node_kernel {
         ggml_cos->nb[2]      = ggml_cos->nb[1] * ggml_cos->ne[1];
         ggml_cos->nb[3]      = ggml_cos->nb[2] * ggml_cos->ne[2];
 
-        rtMallocHost(&cos_data, ggml_nelements(ggml_cos.get()) * ggml_type_size(ggml_cos->type));
-        ggml_cos->data = nullptr;
-        RPP_CHECK(rtMalloc(&(ggml_cos->data), ggml_nelements(ggml_cos.get()) * ggml_type_size(ggml_cos->type)));
+        const size_t host_type_size_cos = type_size_cos < sizeof(float) ? sizeof(float) : type_size_cos;
+        rtMallocHost(&cos_data, ggml_nelements(ggml_cos.get()) * host_type_size_cos);
+        ggml_cos->data = cos_device_data;
+        if (!ggml_cos->data) {
+            RPP_CHECK(rtMalloc(&(ggml_cos->data), ggml_nelements(ggml_cos.get()) * ggml_type_size(ggml_cos->type)));
+        }
 
         rtMallocHost(&start_pos_data, ggml_type_size(cur_ggml_tensor->src[1]->type));
     }
@@ -196,16 +211,25 @@ struct rpp_kernel_rope : public rpp_node_kernel {
                             const RPPgraphNode * dependencies    = nullptr,
                             size_t               numDependencies = 0) override {
         GGML_ASSERT(hGraph);
-        GGML_ASSERT(kernel_ctx->graph);
+        GGML_ASSERT(kernel_ctx->graphexec);
         if (ori_rpp_node) {
-            RPP_CHECK(rppGraphAddChildGraphNode(&(kernel_ctx->graph_node), hGraph, dependencies, numDependencies,
-                                                kernel_ctx->graph));
+            // RPP_CHECK(rppGraphAddChildGraphNode(&(kernel_ctx->graph_node), hGraph, dependencies, numDependencies,
+            //                                     kernel_ctx->graph));
+            RPP_CHECK(rppGraphAddChildGraphexecNode(&(kernel_ctx->graph_node), hGraph, dependencies, numDependencies,
+                                                kernel_ctx->graphexec));
             return;
         }
-        RPP_CHECK(rppGraphAddChildGraphNode(&(io_update_kernel_ctx->graph_node), hGraph, dependencies, numDependencies,
-                                            io_update_kernel_ctx->graph));
-        RPP_CHECK(rppGraphAddChildGraphNode(&(kernel_ctx->graph_node), hGraph, dependencies, numDependencies,
-                                            kernel_ctx->graph));
+        if (io_update_kernel_ctx) {
+            GGML_ASSERT(io_update_kernel_ctx->graphexec);
+            // RPP_CHECK(rppGraphAddChildGraphNode(&(io_update_kernel_ctx->graph_node), hGraph, dependencies,
+            //                                     numDependencies, io_update_kernel_ctx->graph));
+            RPP_CHECK(rppGraphAddChildGraphexecNode(&(io_update_kernel_ctx->graph_node), hGraph, dependencies, numDependencies,
+                                                io_update_kernel_ctx->graphexec));
+        }
+        // RPP_CHECK(rppGraphAddChildGraphNode(&(kernel_ctx->graph_node), hGraph, dependencies, numDependencies,
+        //                                     kernel_ctx->graph));
+        RPP_CHECK(rppGraphAddChildGraphexecNode(&(kernel_ctx->graph_node), hGraph, dependencies, numDependencies,
+                                                kernel_ctx->graphexec));
     }
 
     std::shared_ptr<ggml_tensor> ggml_sin{ nullptr };
@@ -217,6 +241,7 @@ struct rpp_kernel_rope : public rpp_node_kernel {
 
     std::shared_ptr<rpp_kernel_context> io_update_kernel_ctx{ nullptr };
     RPPdeviceptr                        start_pos_cdma_desc{ 0 };
+    bool                                is_k_shift{ false };
 };
 
 inline bool ggml_rpp_op_rope(ggml_backend_rpp_context & ctx,

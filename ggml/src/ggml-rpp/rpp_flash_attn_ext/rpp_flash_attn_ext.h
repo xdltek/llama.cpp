@@ -37,14 +37,6 @@ struct rpp_kernel_flash_attn_ext : public rpp_node_kernel {
     explicit rpp_kernel_flash_attn_ext(ggml_tensor * tensor, ggml_rpp_node * rpp_node) :
         rpp_node_kernel(tensor, rpp_node) {}
 
-    // all flash attn ext kernel will shared the same workspace,
-    void init_workspace(ggml_backend_rpp_context & ctx) {
-        this->kernel_ctx->dev_workspace =
-            (RPPdeviceptr) (ctx.pool().alloc((64 * 1024 + 64 * 1024) * (int) sizeof(uint16_t)));
-    }
-
-    void init_workspace(RPPdeviceptr dev_workspace) { this->kernel_ctx->dev_workspace = dev_workspace; }
-
     bool rpp_dispatch_func(ggml_backend_rpp_context & ctx,
                            ggml_tensor *              dst,
                            int                        is_instantial = 1,
@@ -52,17 +44,7 @@ struct rpp_kernel_flash_attn_ext : public rpp_node_kernel {
         return ggml_rpp_op_kernel_flash_attn_ext(ctx, dst, is_instantial, is_launch);
     }
 
-    RPPdeviceptr dev_shared_kparas{ 0 };
-
-    size_t shared_kpara_size{ 0 };
-
     uint32_t    kv_length{ 0 };
-
-    ~rpp_kernel_flash_attn_ext() {
-        if (dev_shared_kparas != 0) {
-            RPP_CHECK(rppGraphResourceFree(dev_shared_kparas, RPP_GRAPH_RESOURCE_KPARA));
-        }
-    }
 };
 
 inline bool ggml_rpp_op_flash_attn_ext(ggml_backend_rpp_context & ctx,

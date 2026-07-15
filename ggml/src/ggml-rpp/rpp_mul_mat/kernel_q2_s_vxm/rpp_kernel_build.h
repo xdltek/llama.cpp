@@ -10,14 +10,65 @@
 #include <assert.h>
 #include <rpp_runtime.h>
 
-#include <array>
 #include <csignal>
 #include <cstdint>
 #include <cstring>
 #include <iostream>
+#include <mutex>
+#include <stdexcept>
 #include <vector>
 
 namespace kernel_q2_s_vxm {
+
+static void q2s_vxm_prepare_lut_workspace_once(rpp_kernel_context & ctx,
+                                               int                  qscale_lut_bytes,
+                                               int                  grid_lut_bytes,
+                                               RPPdeviceptr &       devB_qscale_lut,
+                                               RPPdeviceptr &       devB_grid_lut) {
+    static std::mutex   mutex;
+    static RPPdeviceptr kernel_lut_workspace       = 0;
+    static int          kernel_lut_workspace_bytes = 0;
+
+    const int lut_workspace_bytes = qscale_lut_bytes + grid_lut_bytes;
+    std::lock_guard<std::mutex> lock(mutex);
+    if (kernel_lut_workspace == 0) {
+        if (rtMalloc((void **) &kernel_lut_workspace, lut_workspace_bytes) != rtSuccess) {
+            throw std::runtime_error("Q2S VXM rtMalloc failed for shared LUT workspace");
+        }
+        kernel_lut_workspace_bytes = lut_workspace_bytes;
+
+        RPPdeviceptr devB_qscale_lut_shared = kernel_lut_workspace;
+        RPPdeviceptr devB_grid_lut_shared   = devB_qscale_lut_shared + qscale_lut_bytes;
+
+        const int qscale_lut_elems = qscale_lut_bytes / (int) sizeof(uint16_t);
+        const int grid_lut_elems   = grid_lut_bytes / (int) sizeof(uint64_t);
+        std::vector<uint16_t> qscale_lut(qscale_lut_elems);
+        for (int i = 0; i < qscale_lut_elems; ++i) {
+            const float scale4  = (float) i;
+            const float lut_val = (0.5f + scale4) * 0.25f;
+            qscale_lut[i]       = float_to_bf16_rne(lut_val);
+        }
+        std::vector<uint64_t> grid_lut(grid_lut_elems);
+        std::memcpy(grid_lut.data(), iq2s_grid_local, grid_lut_bytes);
+
+        rtMemcpy((void *) devB_qscale_lut_shared, qscale_lut.data(), qscale_lut_bytes, rtMemcpyHostToDevice);
+        rtMemcpy((void *) devB_grid_lut_shared, grid_lut.data(), grid_lut_bytes, rtMemcpyHostToDevice);
+    } else if (kernel_lut_workspace_bytes != lut_workspace_bytes) {
+        throw std::runtime_error("Q2S VXM shared LUT workspace size mismatch");
+    }
+
+    RPPdeviceptr dev_lut_workspace = ctx.dev_workspace;
+    if (dev_lut_workspace == 0) {
+        dev_lut_workspace = kernel_lut_workspace;
+        ctx.dev_workspace = dev_lut_workspace;
+    } else if (dev_lut_workspace != kernel_lut_workspace) {
+        rtMemcpy((void *) dev_lut_workspace, (const void *) kernel_lut_workspace, lut_workspace_bytes,
+                 rtMemcpyDeviceToDevice);
+    }
+
+    devB_qscale_lut = dev_lut_workspace;
+    devB_grid_lut   = devB_qscale_lut + qscale_lut_bytes;
+}
 
 inline void get_tiles_info(int   N,
                            int   K,
@@ -135,7 +186,6 @@ static void rpp_matmul_q2s_vxm(rpp_kernel_context & ctx,
     const int             grid_lut_elems      = 1024;
     const int             qscale_lut_bytes    = qscale_lut_elems * (int) sizeof(uint16_t);
     const int             grid_lut_bytes      = grid_lut_elems * (int) sizeof(uint64_t);
-    const int             lut_workspace_bytes = qscale_lut_bytes + grid_lut_bytes;
 
     RPPdeviceptr devA              = ctx.dev_in[0];
     RPPdeviceptr devB_codebook_lsb = ctx.dev_in[1];
@@ -144,30 +194,14 @@ static void rpp_matmul_q2s_vxm(rpp_kernel_context & ctx,
     RPPdeviceptr devB_sign         = ctx.dev_in[4];
     RPPdeviceptr devB_super_scale  = ctx.dev_in[5];
     RPPdeviceptr devC              = ctx.dev_out[0];
-    RPPdeviceptr dev_lut_workspace = ctx.dev_workspace;
-    if (dev_lut_workspace == 0) {
-        rtMalloc((void **) &dev_lut_workspace, lut_workspace_bytes);
-        ctx.dev_workspace = dev_lut_workspace;
-    }
-
-    RPPdeviceptr devB_qscale_lut = dev_lut_workspace;
-    RPPdeviceptr devB_grid_lut   = devB_qscale_lut + qscale_lut_bytes;
-
-    std::array<uint16_t, qscale_lut_elems> qscale_lut = {};
-    for (int i = 0; i < qscale_lut_elems; ++i) {
-        const float scale4  = (float) i;
-        const float lut_val = (0.5f + scale4) * 0.25f;
-        qscale_lut[i]       = float_to_bf16_rne(lut_val);
-    }
-    std::array<uint64_t, grid_lut_elems> grid_lut = {};
-    std::memcpy(grid_lut.data(), iq2s_grid_local, grid_lut_bytes);
-    rtMemcpy((void *) devB_qscale_lut, qscale_lut.data(), qscale_lut_bytes, rtMemcpyHostToDevice);
-    rtMemcpy((void *) devB_grid_lut, grid_lut.data(), grid_lut_bytes, rtMemcpyHostToDevice);
+    RPPdeviceptr devB_qscale_lut = 0;
+    RPPdeviceptr devB_grid_lut   = 0;
+    q2s_vxm_prepare_lut_workspace_once(ctx, qscale_lut_bytes, grid_lut_bytes, devB_qscale_lut, devB_grid_lut);
 
     // Capture on kernelStream (like CUDA graph capture pattern)
     rppStreamBeginCapture(ctx.kernelStream, RPP_STREAM_CAPTURE_MODE_GLOBAL);
     RPPmodule cuMod;
-    rppModuleLoad(&ctx.rppBinMod, "rpp_kernel/matmul_q2s_vxm.o");
+    rpp_module_load_once(ctx.rppBinMod, "rpp_kernel/matmul_q2s_vxm.o");
     // -------------------------
     // SRAM allocation planning
     // -------------------------
@@ -484,8 +518,9 @@ static void rpp_matmul_q2s_vxm(rpp_kernel_context & ctx,
 
     // End capture after all enqueued work is defined
     rppStreamEndCapture(ctx.kernelStream, &ctx.graph);
-    if (is_instantial) {
-        rppGraphInstantiate(&ctx.graphexec, ctx.graph, NULL, NULL, 0);
+    const std::string graph_key = rpp_join_function_name_and_args(__func__, M, K, N, weights_group, in_bytes_per_element, out_bytes_per_element);
+    if (rpp_graph_instantiate(ctx.graphexec, ctx.graph, graph_key.c_str(), is_instantial) != RPP_SUCCESS) {
+        throw std::runtime_error("rpp_graph_instantiate failed.");
     }
 }
 

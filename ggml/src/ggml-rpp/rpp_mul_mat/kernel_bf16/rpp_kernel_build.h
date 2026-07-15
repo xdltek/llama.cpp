@@ -102,7 +102,7 @@ static void rpp_matmul_bf16_build(rpp_kernel_context & ctx,
     RPPdeviceptr devC      = ctx.dev_out[0];
 
     rppStreamBeginCapture(ctx.kernelStream, RPP_STREAM_CAPTURE_MODE_GLOBAL);
-    rppModuleLoad(&ctx.rppBinMod, "rpp_kernel/matmul_bf16.o");
+    rpp_module_load_once(ctx.rppBinMod, "rpp_kernel/matmul_bf16.o");
 
     const int SRAM_LIMIT            = 22 * 1024 * 1024;
     const int sizeB_tile            = Kr * MATMUL_NS * (int) sizeof(uint16_t);
@@ -253,8 +253,9 @@ static void rpp_matmul_bf16_build(rpp_kernel_context & ctx,
     }
 
     rppStreamEndCapture(ctx.kernelStream, &ctx.graph);
-    if (is_instantial) {
-        rppGraphInstantiate(&ctx.graphexec, ctx.graph, NULL, NULL, 0);
+    const std::string graph_key = rpp_join_function_name_and_args(__func__, M, K, N, weights_group, in_bytes_per_element, out_bytes_per_element);
+    if (rpp_graph_instantiate(ctx.graphexec, ctx.graph, graph_key.c_str(), is_instantial) != RPP_SUCCESS) {
+        throw std::runtime_error("rpp_graph_instantiate failed.");
     }
 }
 }  // namespace kernel_bf16

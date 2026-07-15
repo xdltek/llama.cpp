@@ -16,6 +16,7 @@
 #include <cstring>
 #include <fstream>
 #include <iostream>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -201,21 +202,31 @@ static inline void silu_prepare_sram_io(rpp_kernel_context & ctx,
 static inline RPPdeviceptr silu_prepare_lut_workspace(rpp_kernel_context & ctx) {
     constexpr uint32_t lut_elements = 64u * 1024u;
     constexpr uint32_t lut_bytes    = lut_elements * (uint32_t) sizeof(uint16_t);
+    static std::mutex   mutex;
+    static RPPdeviceptr kernel_lut_workspace = 0;
+
+    std::lock_guard<std::mutex> lock(mutex);
+    if (kernel_lut_workspace == 0) {
+        rtMalloc((void **) &kernel_lut_workspace, lut_bytes);
+
+        std::vector<uint16_t> silu_table(lut_elements);
+        for (uint32_t i = 0; i < lut_elements; ++i) {
+            uint32_t x0   = i << 16;
+            float    x    = *(float *) &x0;
+            float    y    = x / (1.0f + std::exp(-x));
+            silu_table[i] = rpp::bfloat16::round_to_bfloat16(y).value;
+        }
+        rtMemcpy((void *) kernel_lut_workspace, silu_table.data(), lut_bytes, rtMemcpyHostToDevice);
+    }
 
     RPPdeviceptr dev_lut_workspace = ctx.dev_workspace;
     if (dev_lut_workspace == 0) {
-        rtMalloc((void **) &dev_lut_workspace, lut_bytes);
-        ctx.dev_workspace = dev_lut_workspace;
+        ctx.dev_workspace = kernel_lut_workspace;
+        return kernel_lut_workspace;
     }
-
-    std::vector<uint16_t> silu_table(lut_elements);
-    for (uint32_t i = 0; i < lut_elements; ++i) {
-        uint32_t x0   = i << 16;
-        float    x    = *(float *) &x0;
-        float    y    = x / (1.0f + std::exp(-x));
-        silu_table[i] = rpp::bfloat16::round_to_bfloat16(y).value;
+    if (dev_lut_workspace != kernel_lut_workspace) {
+        rtMemcpy((void *) dev_lut_workspace, (const void *) kernel_lut_workspace, lut_bytes, rtMemcpyDeviceToDevice);
     }
-    rtMemcpy((void *) dev_lut_workspace, silu_table.data(), lut_bytes, rtMemcpyHostToDevice);
     return dev_lut_workspace;
 }
 

@@ -228,17 +228,6 @@ bool ggml_rpp_op_kernel_cpy(ggml_backend_rpp_context & ctx, ggml_tensor * dst, i
             if (!(ggml_rpp_create_kernel_dispatch(ctx, rpp_node, dst))) {
                 return false;
             }
-            if (!is_instantial) {
-                rpp_kernel_context * kctx = rpp_node->kernel_ctx.get();
-                GGML_ASSERT(kctx && kctx->graph);
-                if (kctx->graphexec != nullptr) {
-                    RPP_CHECK(rppGraphExecDestroy(kctx->graphexec));
-                    kctx->graphexec = nullptr;
-                }
-                RPP_GRAPH_INSTANTIATE_PARAMS instChild = {};
-                instChild.flags                        = RPP_GRAPH_INSTANTIATE_FLAG_CHILD_EXEC;
-                RPP_CHECK(rppGraphInstantiateWithParams(&kctx->graphexec, kctx->graph, &instChild));
-            }
         }
         GGML_ASSERT(rpp_node);
         ctx.cur_rpp_graph->cur_rpp_nodes[dst] = rpp_node;

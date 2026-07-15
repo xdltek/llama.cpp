@@ -1,33 +1,51 @@
 #include "rpp_flash_attn_ext/rpp_flash_attn_ext.h"
 #include "rpp_flash_attn_ext/src/rpp_kernel_build.h"
 
+#include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <numeric>
+
+static int ggml_rpp_flash_attn_ext_parse_layer_suffix(const char * name, const char * prefix) {
+    if (name == nullptr || prefix == nullptr) {
+        return -1;
+    }
+    const char * pos = std::strstr(name, prefix);
+    if (pos == nullptr) {
+        return -1;
+    }
+    pos += std::strlen(prefix);
+    if (*pos < '0' || *pos > '9') {
+        return -1;
+    }
+
+    char *     end   = nullptr;
+    const long layer = std::strtol(pos, &end, 10);
+    if (end == pos || layer < 0 || layer > std::numeric_limits<int>::max()) {
+        return -1;
+    }
+    return (int) layer;
+}
+
+static bool ggml_rpp_flash_attn_ext_uses_cross_layer_kv_cache(const ggml_tensor * dst) {
+    if (dst == nullptr || dst->op != GGML_OP_FLASH_ATTN_EXT || dst->src[1] == nullptr) {
+        return false;
+    }
+
+    const ggml_tensor * k_base = dst->src[1]->view_src ? dst->src[1]->view_src : dst->src[1];
+    const int          attn_layer =
+        ggml_rpp_flash_attn_ext_parse_layer_suffix(ggml_get_name(dst), "__fattn__-");
+    const int kv_layer = ggml_rpp_flash_attn_ext_parse_layer_suffix(ggml_get_name(k_base), "cache_k_l");
+
+    return attn_layer >= 0 && kv_layer >= 0 && attn_layer != kv_layer;
+}
 
 static int ggml_rpp_flash_attention_seq_len(ggml_tensor * dst, ggml_rpp_node * node) {
     GGML_ASSERT(node);
     return dst->ne[node->seq_len_index];
-}
-
-static ggml_rpp_node * ggml_rpp_find_flash_attn_ext_node(ggml_backend_rpp_context & ctx, ggml_tensor * dst) {
-    for (auto & graph_iter : ctx.gglm_graphs) {
-        ggml_rpp_cgraph * rpp_graph_tmp = ctx.rpp_graphs[graph_iter].get();
-        if (!rpp_graph_tmp) {
-            continue;
-        }
-        for (auto & node_iter : rpp_graph_tmp->rpp_nodes) {
-            if (node_iter.first != dst && node_iter.first->op == GGML_OP_FLASH_ATTN_EXT) {
-                auto & node_vec = node_iter.second;
-                for (size_t i = 0; i < node_vec.size(); i++) {
-                    auto cur_node = node_vec[i].get();
-                    return cur_node;
-                }
-            }
-        }
-    }
-    return nullptr;
 }
 
 static bool ggml_rpp_create_engine_flash_attention(ggml_backend_rpp_context & ctx,
@@ -75,15 +93,6 @@ static bool ggml_rpp_create_engine_flash_attention(ggml_backend_rpp_context & ct
     float scale = 1.0f;
     memcpy(&scale, (float *) dst->op_params + 0, sizeof(float));
     rpp_node->kernel_ctx->dev_out.emplace_back((RPPdeviceptr) (dst->data));
-
-    // find first rms_node, and all flash_attn_ext kernel will shared the same workspace
-    auto ori_rpp_node = ggml_rpp_find_flash_attn_ext_node(ctx, dst);
-    if (ori_rpp_node) {
-        auto ori_rms_node = static_cast<rpp_kernel_flash_attn_ext *>(ori_rpp_node);
-        rpp_node->init_workspace(ori_rms_node->kernel_ctx->dev_workspace);
-    } else {
-        rpp_node->init_workspace(ctx);
-    }
 
     int kv_bytes_per_elem   = ggml_rpp_get_io_type_size(ctx, dst->src[1], 0);
     int io_bytes_per_elem   = ggml_rpp_get_io_type_size(ctx, dst->src[0], 0);
@@ -168,87 +177,6 @@ static ggml_rpp_flash_attn_ext_stage ggml_rpp_flash_attn_ext_get_stage(ggml_rpp_
     // In RPP kernels, n_ubatch > 1 maps to prefill, n_ubatch == 1 maps to decode.
     return rpp_node->n_ubatch > 1 ? GGML_RPP_FLASH_ATTN_EXT_STAGE_PREFILL
                                   : GGML_RPP_FLASH_ATTN_EXT_STAGE_DECODE;
-}
-
-static rpp_kernel_flash_attn_ext * ggml_rpp_find_shared_kpara_node(ggml_backend_rpp_context &      ctx,
-                                                                    uint32_t                         kv_length,
-                                                                    ggml_rpp_flash_attn_ext_stage    stage) {
-    for (auto & graph_iter : ctx.gglm_graphs) {
-        ggml_rpp_cgraph * rpp_graph_tmp = ctx.rpp_graphs[graph_iter].get();
-        if (!rpp_graph_tmp) {
-            continue;
-        }
-        for (auto & node_iter : rpp_graph_tmp->rpp_nodes) {
-            if (node_iter.first->op == GGML_OP_FLASH_ATTN_EXT) {
-                auto & node_vec = node_iter.second;
-                for (size_t i = 0; i < node_vec.size(); i++) {
-                    auto cur_node = static_cast<rpp_kernel_flash_attn_ext *>(node_vec[i].get());
-                    if (cur_node->rpp_type != ggml_rpp_node::RPP_NODE_TYPE_KERNEL) {
-                        continue;
-                    }
-                    if (cur_node->kv_length != kv_length || cur_node->dev_shared_kparas == 0 ||
-                        cur_node->shared_kpara_size == 0) {
-                        continue;
-                    }
-                    const auto node_stage = ggml_rpp_flash_attn_ext_get_stage(cur_node);
-                    if (node_stage == stage) {
-                        return cur_node;
-                    }
-                }
-            }
-        }
-    }
-    return nullptr;
-}
-
-static bool ggml_rpp_flash_attn_ext_instantiate_child_exec(ggml_backend_rpp_context & ctx,
-                                                            uint32_t kv_length,
-                                                            ggml_rpp_node *             rpp_base_node) {
-    GGML_ASSERT(rpp_base_node);
-    auto                 rpp_node = static_cast<rpp_kernel_flash_attn_ext *>(rpp_base_node);
-    rpp_kernel_context * kctx     = rpp_node->kernel_ctx.get();
-    GGML_ASSERT(kctx && kctx->graph);
-
-    if (kctx->graphexec != nullptr) {
-        return false;
-    }
-
-    if (kctx->graphexec != nullptr) {
-        RPP_CHECK(rppGraphExecDestroy(kctx->graphexec));
-        kctx->graphexec = nullptr;
-        return false;
-    }
-
-    const auto stage      = ggml_rpp_flash_attn_ext_get_stage(rpp_node);
-    auto *     reuse_node = ggml_rpp_find_shared_kpara_node(ctx, kv_length, stage);
-    RPP_GRAPH_INSTANTIATE_PARAMS instChild = {};
-    instChild.flags                        = RPP_GRAPH_INSTANTIATE_FLAG_CHILD_EXEC;
-    if (reuse_node != nullptr) {
-        instChild.res_kpara.is_external = true;
-        instChild.res_kpara.type        = RPP_GRAPH_RESOURCE_KPARA;
-        instChild.res_kpara.daddr       = reuse_node->dev_shared_kparas;
-        instChild.res_kpara.size        = reuse_node->shared_kpara_size;        
-    }
-    RPP_CHECK(rppGraphInstantiateWithParams(&kctx->graphexec, kctx->graph, &instChild));
-
-    GGML_ASSERT(kctx->graphexec);
-    if (reuse_node == nullptr) {
-        RPP_GRAPH_INSTANTIATE_PARAMS probe_params = {};
-        RPP_CHECK(rppGraphExecGetParams(kctx->graphexec, &probe_params));
-        if (probe_params.res_kpara.size == 0) {
-            GGML_LOG_ERROR("%s: invalid kpara size 0 for kv_length=%llu, %s (%s)\n", __func__,
-                           (unsigned long long) kv_length, rpp_node->cur_ggml_tensor->name,
-                           ggml_op_name(rpp_node->cur_ggml_tensor->op));
-            return false;
-        }
-
-        RPPdeviceptr shared_kpara = 0;
-        RPP_CHECK(rppGraphResourceAlloc(&shared_kpara, probe_params.res_kpara.size, RPP_GRAPH_RESOURCE_KPARA));
-        rpp_node->dev_shared_kparas    = shared_kpara;
-        rpp_node->shared_kpara_size = probe_params.res_kpara.size;        
-    }
-
-    return true;
 }
 
 static bool ggml_rpp_set_io_datas_device(ggml_backend_rpp_context & ctx, ggml_rpp_node * rpp_base_node) {
@@ -359,46 +287,50 @@ bool ggml_rpp_op_kernel_flash_attn_ext(ggml_backend_rpp_context & ctx,
             }
         }
         if (!rpp_node) {
-            const int base_kv_len = 256;
-            size_t    max_kv_step = std::min(ctx.n_max_ctx / base_kv_len, ctx.stub_kv_step);
-            if (dst->src[1]->ne[1] < max_kv_step * base_kv_len) {
-                for (size_t kv_step = 0; kv_step < max_kv_step; kv_step++) {
-                    auto new_node = std::make_unique<rpp_kernel_flash_attn_ext>(dst);
-                    ctx.cur_rpp_graph->rpp_nodes[dst].emplace_back(std::move(new_node));
-                    auto rpp_node_tmp = (rpp_kernel_flash_attn_ext *) (ctx.cur_rpp_graph->rpp_nodes[dst].back().get());
-                    rpp_node_tmp->is_instantial = is_instantial;
-                    rpp_node_tmp->kv_length     = (kv_step + 1) * base_kv_len;
-                    const uint64_t kv_length_key = static_cast<uint64_t>(rpp_node_tmp->kv_length);
-                    if (!(ggml_rpp_flash_attention_create_engine_dispatch(ctx, rpp_node_tmp, dst))) {
-                        return false;
-                    }
-                    if (!is_instantial) {
-                        if (!ggml_rpp_flash_attn_ext_instantiate_child_exec(ctx, rpp_node_tmp->kv_length, rpp_node_tmp)) {
-                            return false;
-                        }
-                    }
-                }
-                auto & node_vec = ctx.cur_rpp_graph->rpp_nodes[dst];
-                for (size_t i = 0; i < node_vec.size(); i++) {
-                    auto cur_node = node_vec[i].get();
-                    if (cur_node->rpp_type == ggml_rpp_node::RPP_NODE_TYPE_KERNEL &&
-                        ggml_rpp_flash_attn_ext_properties_is_same(ctx, dst, cur_node)) {
-                        rpp_node = (rpp_kernel_flash_attn_ext *) cur_node;
-                        break;
-                    }
-                }
-            } else {
+            TRACE_SCOPE_GUARD(ctx.trace_id, "create_kernel_flash_attn_ext");
+            if (ggml_rpp_flash_attn_ext_uses_cross_layer_kv_cache(dst)) {
                 auto new_node = std::make_unique<rpp_kernel_flash_attn_ext>(dst);
                 ctx.cur_rpp_graph->rpp_nodes[dst].emplace_back(std::move(new_node));
                 rpp_node = (rpp_kernel_flash_attn_ext *) (ctx.cur_rpp_graph->rpp_nodes[dst].back().get());
                 rpp_node->is_instantial = is_instantial;
                 rpp_node->kv_length     = dst->src[1]->ne[1];
-                const uint64_t kv_length_key = static_cast<uint64_t>(rpp_node->kv_length);
                 if (!(ggml_rpp_flash_attention_create_engine_dispatch(ctx, rpp_node, dst))) {
                     return false;
                 }
-                if (!is_instantial) {
-                    ggml_rpp_flash_attn_ext_instantiate_child_exec(ctx, rpp_node->kv_length, rpp_node);
+            } else {
+                const int base_kv_len = 256;
+                size_t    max_kv_step = std::min(ctx.n_max_ctx / base_kv_len, ctx.stub_kv_step);
+                const int64_t max_prebuild_kv_len = (int64_t) max_kv_step * base_kv_len;
+                if (dst->src[1]->ne[1] < max_prebuild_kv_len) {
+                    for (size_t kv_step = 0; kv_step < max_kv_step; kv_step++) {
+                        auto new_node = std::make_unique<rpp_kernel_flash_attn_ext>(dst);
+                        ctx.cur_rpp_graph->rpp_nodes[dst].emplace_back(std::move(new_node));
+                        auto rpp_node_tmp =
+                            (rpp_kernel_flash_attn_ext *) (ctx.cur_rpp_graph->rpp_nodes[dst].back().get());
+                        rpp_node_tmp->is_instantial = is_instantial;
+                        rpp_node_tmp->kv_length     = (kv_step + 1) * base_kv_len;
+                        if (!(ggml_rpp_flash_attention_create_engine_dispatch(ctx, rpp_node_tmp, dst))) {
+                            return false;
+                        }
+                    }
+                    auto & node_vec = ctx.cur_rpp_graph->rpp_nodes[dst];
+                    for (size_t i = 0; i < node_vec.size(); i++) {
+                        auto cur_node = node_vec[i].get();
+                        if (cur_node->rpp_type == ggml_rpp_node::RPP_NODE_TYPE_KERNEL &&
+                            ggml_rpp_flash_attn_ext_properties_is_same(ctx, dst, cur_node)) {
+                            rpp_node = (rpp_kernel_flash_attn_ext *) cur_node;
+                            break;
+                        }
+                    }
+                } else {
+                    auto new_node = std::make_unique<rpp_kernel_flash_attn_ext>(dst);
+                    ctx.cur_rpp_graph->rpp_nodes[dst].emplace_back(std::move(new_node));
+                    rpp_node = (rpp_kernel_flash_attn_ext *) (ctx.cur_rpp_graph->rpp_nodes[dst].back().get());
+                    rpp_node->is_instantial = is_instantial;
+                    rpp_node->kv_length     = dst->src[1]->ne[1];
+                    if (!(ggml_rpp_flash_attention_create_engine_dispatch(ctx, rpp_node, dst))) {
+                        return false;
+                    }
                 }
             }
         }

@@ -43,13 +43,6 @@ struct rpp_kernel_glu : public rpp_node_kernel {
         }
     }
 
-    // all glu kernel will shared the same workspace,
-    void init_workspace(ggml_backend_rpp_context & ctx) {
-        this->kernel_ctx->dev_workspace = (RPPdeviceptr) (ctx.pool().alloc((64 * 1024) * (int) sizeof(uint16_t)));
-    }
-
-    void init_workspace(RPPdeviceptr dev_workspace) { this->kernel_ctx->dev_workspace = dev_workspace; }
-
     void * sram_io{ nullptr };
 
     bool rpp_dispatch_func(ggml_backend_rpp_context & ctx,

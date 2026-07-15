@@ -35,7 +35,7 @@ void rpp_scale_build(rpp_kernel_context & ctx,
 
     rppStreamBeginCapture(ctx.kernelStream, RPP_STREAM_CAPTURE_MODE_GLOBAL);
     RPPmodule cuMod;
-    rppModuleLoad(&ctx.rppBinMod, "rpp_kernel/scale.o");
+    rpp_module_load_once(ctx.rppBinMod, "rpp_kernel/scale.o");
     RPPdeviceptr sram_base = ctx.virtual_sram_base;
     for (int i = 0; i < num_of_tiles - 1; i++) {
         // -------------------------
@@ -174,7 +174,14 @@ void rpp_scale_build(rpp_kernel_context & ctx,
     }
     // End capture after all enqueued work is defined
     rppStreamEndCapture(ctx.kernelStream, &ctx.graph);
-    if (is_instantial) {
-        rppGraphInstantiate(&ctx.graphexec, ctx.graph, NULL, NULL, 0);
+    uint32_t scale_bits = 0;
+    uint32_t bias_bits  = 0;
+    memcpy(&scale_bits, &scale, sizeof(scale_bits));
+    memcpy(&bias_bits, &bias, sizeof(bias_bits));
+    const std::string graph_key =
+        rpp_join_function_name_and_args(__func__, elements, scale_bits, bias_bits, in_bytes_per_element,
+                                        out_bytes_per_element);
+    if (rpp_graph_instantiate(ctx.graphexec, ctx.graph, graph_key.c_str(), is_instantial) != RPP_SUCCESS) {
+        throw std::runtime_error("rpp_graph_instantiate failed.");
     }
 }

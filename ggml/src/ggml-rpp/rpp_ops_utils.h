@@ -146,13 +146,32 @@ template <typename Func, typename... Args> double measure_time_mics(Func && func
  *
  * @param tensor Pointer to the target ggml_tensor object (const-qualified).
  */
+static bool is_conv_weight(const ggml_tensor * tensor) {
+    if (tensor == nullptr || ggml_n_dims(tensor) < 4) {
+        return false;
+    }
+
+    std::string name = ggml_get_name(tensor);
+    static const std::unordered_set<std::string> conv_weight_suffixes{ "patch_embd.weight" };
+    for (const auto & suffix : conv_weight_suffixes) {
+        if (name.find(suffix) != std::string::npos) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static bool is_matmul_weight(const ggml_tensor * tensor) {
-    std::string                                  name = ggml_get_name(tensor);
+    if (is_conv_weight(tensor)) {
+        return false;
+    }
+    std::string name = ggml_get_name(tensor);
     static const std::unordered_set<std::string> matmul_weight_suffixes{
         "output.weight",      "attn_q.weight",      "attn_k.weight",        "attn_v.weight",
         "attn_output.weight", "ffn_gate.weight",    "ffn_up.weight",        "ffn_down.weight",
         "token_embd.weight",  "attn_qkv.weight",    "ffn_down_exps.weight", "ffn_gate_exps.weight",
-        "ffn_up_exps.weight", "ffn_gate_inp.weight"
+        "ffn_up_exps.weight", "ffn_gate_inp.weight", "inp_gate.weight",      "proj.weight",
+        "per_layer_model_proj.weight", "patch_embd.weight"
     };
 
     for (const auto & suffix : matmul_weight_suffixes) {

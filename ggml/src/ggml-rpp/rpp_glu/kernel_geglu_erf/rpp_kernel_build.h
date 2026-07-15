@@ -5,12 +5,60 @@
 #include <assert.h>
 #include <rpp_runtime.h>
 
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <iostream>
+#include <mutex>
 #include <vector>
 
 namespace kernel_geglu_erf {
+
+static RPPdeviceptr gelu_prepare_lut_workspace_once(rpp_kernel_context & ctx, int gelu_variant, int lut_elements) {
+    static std::mutex   mutex;
+    static RPPdeviceptr kernel_lut_workspaces[3] = {};
+
+    std::lock_guard<std::mutex> lock(mutex);
+    assert(gelu_variant >= 0 && gelu_variant < 3);
+    RPPdeviceptr & kernel_lut_workspace = kernel_lut_workspaces[gelu_variant];
+    const size_t   lut_bytes            = (size_t) lut_elements * sizeof(uint16_t);
+
+    if (kernel_lut_workspace == 0) {
+        rtMalloc((void **) &kernel_lut_workspace, lut_bytes);
+
+        std::vector<uint16_t> gelu_table(lut_elements);
+        for (uint32_t i = 0; i < (uint32_t) lut_elements; i++) {
+            uint32_t x0 = i;
+            x0 <<= 16;
+            float x;
+            memcpy(&x, &x0, sizeof(x));
+            float y;
+            if (gelu_variant == 1) {
+                const float inv_sqrt2 = 0.70710678118654752440f;
+                y = 0.5f * x * (1.0f + std::erff(x * inv_sqrt2));
+            } else if (gelu_variant == 2) {
+                y = x / (1.0f + std::exp(-1.702f * x));
+            } else {
+                const float sqrt_2_over_pi = 0.79788456080286535587989211986876f;
+                const float gelu_coef_a    = 0.044715f;
+                y = 0.5f * x * (1.0f + std::tanh(sqrt_2_over_pi * x * (1.0f + gelu_coef_a * x * x)));
+            }
+            gelu_table[i] = rpp::bfloat16::round_to_bfloat16(y).value;
+        }
+
+        rtMemcpy((void *) kernel_lut_workspace, (const void *) gelu_table.data(), lut_bytes, rtMemcpyHostToDevice);
+    }
+
+    RPPdeviceptr dev_gelu_lut = ctx.dev_workspace;
+    if (dev_gelu_lut == 0) {
+        ctx.dev_workspace = kernel_lut_workspace;
+        return kernel_lut_workspace;
+    }
+    if (dev_gelu_lut != kernel_lut_workspace) {
+        rtMemcpy((void *) dev_gelu_lut, (const void *) kernel_lut_workspace, lut_bytes, rtMemcpyDeviceToDevice);
+    }
+    return dev_gelu_lut;
+}
 
 // -----------------------------
 // Build graph once
@@ -23,6 +71,7 @@ static void rpp_gelu_build(rpp_kernel_context & ctx,
                            int                  split_axis,  // used only by mode2; ignored otherwise
                            int                  in_bytes_per_element,
                            int                  out_bytes_per_element,
+                           int                  gelu_variant, // 0=tanh, 1=erf, 2=quick
                            int                  is_instantial = 1) {
     dim3                  threadsPerBlock;
     dim3                  threadsPerBlockTail;
@@ -53,22 +102,12 @@ static void rpp_gelu_build(rpp_kernel_context & ctx,
         }
     }
 
-    // build exp table
-    int        lut_elements = 64 * 1024;
-    uint16_t * gelu_table   = (uint16_t *) malloc(lut_elements * sizeof(uint16_t));
-    for (uint32_t i = 0; i < lut_elements; i++) {
-        uint32_t x0 = i;
-        x0 <<= 16;
-        float       x         = *(float *) &x0;
-        const float inv_sqrt2 = 0.70710678118654752440f;
-        float       y         = 0.5f * x * (1.0f + std::erff(x * inv_sqrt2));
-        gelu_table[i]         = rpp::bfloat16::round_to_bfloat16(y).value;
-    }
-    RPPdeviceptr dev_gelu_lut = ctx.dev_workspace;
-    rtMemcpy((void *) dev_gelu_lut, (const void *) gelu_table, lut_elements * sizeof(short), rtMemcpyHostToDevice);
+    // gelu_variant: 0 -> tanh GELU, 1 -> erf GELU, 2 -> quick GELU.
+    const int    lut_elements = 64 * 1024;
+    RPPdeviceptr dev_gelu_lut = gelu_prepare_lut_workspace_once(ctx, gelu_variant, lut_elements);
     rppStreamBeginCapture(ctx.kernelStream, RPP_STREAM_CAPTURE_MODE_GLOBAL);
     RPPmodule cuMod;
-    rppModuleLoad(&ctx.rppBinMod, "rpp_kernel/gelu.o");
+    rpp_module_load_once(ctx.rppBinMod, "rpp_kernel/gelu.o");
 
     const int    lutSize         = 64 * 1024 * sizeof(short);
     RPPdeviceptr sram_base       = ctx.virtual_sram_base;
@@ -209,7 +248,7 @@ static void rpp_gelu_build(rpp_kernel_context & ctx,
             launchWrapperAysnc("opt_vector_cvt_32_16", blocksPerGrid, threadsPerBlock, params, ctx.rppBinMod,
                                ctx.kernelStream);
             if (mode == 1) {
-                calc_tbdim_flattern(1, norm_tiles, threadsPerBlock, blocksPerGrid);
+                calc_tbdim_flattern(1, tail_tiles, threadsPerBlock, blocksPerGrid);
                 params.clear();
                 cvt_kernel_param_init(threadsPerBlock, sramA1, sramA1, kFLOAT, kBF16, params);
                 launchWrapperAysnc("opt_vector_cvt_32_16", blocksPerGrid, threadsPerBlock, params, ctx.rppBinMod,
@@ -261,11 +300,13 @@ static void rpp_gelu_build(rpp_kernel_context & ctx,
                           ctx.kernelStream);
         }
     }
-    free(gelu_table);
     // End capture after all enqueued work is defined
     rppStreamEndCapture(ctx.kernelStream, &ctx.graph);
-    if (is_instantial) {
-        rppGraphInstantiate(&ctx.graphexec, ctx.graph, NULL, NULL, 0);
+    const std::string graph_key =
+        rpp_join_function_name_and_args(__func__, mode, C, H, W, split_axis, in_bytes_per_element,
+                                        out_bytes_per_element);
+    if (rpp_graph_instantiate(ctx.graphexec, ctx.graph, graph_key.c_str(), is_instantial) != RPP_SUCCESS) {
+        throw std::runtime_error("rpp_graph_instantiate failed.");
     }
 }
 }  // namespace kernel_geglu_erf

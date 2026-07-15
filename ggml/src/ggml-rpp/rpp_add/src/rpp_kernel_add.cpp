@@ -15,9 +15,15 @@ static bool ggml_rpp_create_kernel_add(ggml_backend_rpp_context & ctx,
     // GGML_ASSERT(ggml_is_contiguous(dst->src[1]));
 
     const int seq_len = ggml_rpp_add_seq_len(dst, rpp_node);
-    const int C       = dst->src[0]->ne[2];
-    const int H       = (ctx.use_ubatch && seq_len > 1) ? rpp_node->n_ubatch : dst->src[0]->ne[1];
-    const int W       = dst->src[0]->ne[0];
+
+    int C       = dst->src[0]->ne[2];
+    int H       = dst->src[0]->ne[1];
+    int W       = dst->src[0]->ne[0];
+    if (rpp_node->seq_len_index != 2) {
+        H       = (ctx.use_ubatch && seq_len > 1) ? rpp_node->n_ubatch : dst->src[0]->ne[1];
+    } else {
+        C = (ctx.use_ubatch && seq_len > 1) ? rpp_node->n_ubatch : dst->src[0]->ne[2];
+    }
 
     void * inputs_0_buf = dst->src[0]->data;
     void * inputs_1_buf = dst->src[1]->data;
@@ -73,7 +79,7 @@ static bool ggml_rpp_create_engine_dispatch(ggml_backend_rpp_context & ctx,
     } else {
         rpp_node->seq_len_index = ctx.cur_rpp_graph->rpp_nodes[dst].front().get()->seq_len_index;
     }
-    GGML_ASSERT(rpp_node->seq_len_index == 1);
+    // GGML_ASSERT(rpp_node->seq_len_index == 1);
     // set ubacth for rpp_node
     if (ctx.use_ubatch && ggml_rpp_add_seq_len(dst, rpp_node) > 1) {
         rpp_node->n_ubatch = ctx.n_ubatch;

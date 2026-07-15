@@ -1,8 +1,9 @@
 {
 	"kernel_type": "app",
-	"kernel_num": 6,
+	"kernel_num": 7,
 	"kernel_name": [
 		"llama3_loop1_pat0_fuse",
+		"llama3_loop1_pat0_fuse_xsplit",
 		"rope_mode2_gen_fuse",
 		"rope_mode2_align_fuse",
 		"mem_copy_2d_align_bf16_yz_opt",
@@ -15,6 +16,12 @@
 	"is_dummy": false,
 	"llama3_loop1_pat0_fuse": {
 		"asm_source": "llama3_loop1_pat0_fuse.s",
+		"concat_store": false,
+		"is_forward": true,
+		"is_compiler": false
+	},
+	"llama3_loop1_pat0_fuse_xsplit": {
+		"asm_source": "llama3_loop1_pat0_fuse_xsplit.s",
 		"concat_store": false,
 		"is_forward": true,
 		"is_compiler": false

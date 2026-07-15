@@ -11,11 +11,14 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+#include <array>
 #include <cassert>
 #include <cstdint>
 #include <cstring>
 #include <fstream>
 #include <iostream>
+#include <mutex>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -332,29 +335,47 @@ static void q2xs_vxm_nolut_prepare_sram_io(rpp_kernel_context &     ctx,
 }
 
 static RPPdeviceptr q2xs_vxm_nolut_prepare_lut_workspace(rpp_kernel_context & ctx) {
+    static std::mutex   mutex;
+    static RPPdeviceptr kernel_lut_workspace       = 0;
+    static uint32_t     kernel_lut_workspace_bytes = 0;
+
     constexpr uint32_t qscale_lut_bytes = 16u * (uint32_t) sizeof(uint16_t);
     constexpr uint32_t mag_lut_bytes    = 4u * (uint32_t) sizeof(uint16_t);
     constexpr uint32_t total_bytes      = qscale_lut_bytes + mag_lut_bytes;
 
+    std::lock_guard<std::mutex> lock(mutex);
+    if (kernel_lut_workspace == 0) {
+        if (rtMalloc((void **) &kernel_lut_workspace, total_bytes) != rtSuccess) {
+            throw std::runtime_error("Q2XS VXM NoLUT rtMalloc failed for shared LUT workspace");
+        }
+        kernel_lut_workspace_bytes = total_bytes;
+
+        std::array<uint16_t, 16> qscale_lut = {};
+        for (uint32_t i = 0; i < qscale_lut.size(); ++i) {
+            const float lut_val = (0.5f + (float) i) * 0.25f;
+            qscale_lut[i]       = float_to_bf16_rne(lut_val);
+        }
+        std::array<uint16_t, 4> mag_lut = {};
+        const float             mags[4] = { 8.0f, 25.0f, 43.0f, 0.0f };
+        for (int i = 0; i < 4; ++i) {
+            mag_lut[(size_t) i] = float_to_bf16_rne(mags[i]);
+        }
+
+        rtMemcpy((void *) kernel_lut_workspace, qscale_lut.data(), qscale_lut_bytes, rtMemcpyHostToDevice);
+        rtMemcpy((void *) (kernel_lut_workspace + qscale_lut_bytes), mag_lut.data(), mag_lut_bytes,
+                 rtMemcpyHostToDevice);
+    } else if (kernel_lut_workspace_bytes != total_bytes) {
+        throw std::runtime_error("Q2XS VXM NoLUT shared LUT workspace size mismatch");
+    }
+
     RPPdeviceptr dev_lut_workspace = ctx.dev_workspace;
     if (dev_lut_workspace == 0) {
-        rtMalloc((void **) &dev_lut_workspace, total_bytes);
+        dev_lut_workspace = kernel_lut_workspace;
         ctx.dev_workspace = dev_lut_workspace;
+    } else if (dev_lut_workspace != kernel_lut_workspace) {
+        rtMemcpy((void *) dev_lut_workspace, (const void *) kernel_lut_workspace, total_bytes, rtMemcpyDeviceToDevice);
     }
 
-    std::array<uint16_t, 16> qscale_lut = {};
-    for (uint32_t i = 0; i < qscale_lut.size(); ++i) {
-        const float lut_val = (0.5f + (float) i) * 0.25f;
-        qscale_lut[i]       = float_to_bf16_rne(lut_val);
-    }
-    std::array<uint16_t, 4> mag_lut = {};
-    const float             mags[4] = { 8.0f, 25.0f, 43.0f, 0.0f };
-    for (int i = 0; i < 4; ++i) {
-        mag_lut[(size_t) i] = float_to_bf16_rne(mags[i]);
-    }
-
-    rtMemcpy((void *) dev_lut_workspace, qscale_lut.data(), qscale_lut_bytes, rtMemcpyHostToDevice);
-    rtMemcpy((void *) (dev_lut_workspace + qscale_lut_bytes), mag_lut.data(), mag_lut_bytes, rtMemcpyHostToDevice);
     return dev_lut_workspace;
 }
 

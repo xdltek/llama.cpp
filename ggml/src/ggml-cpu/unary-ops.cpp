@@ -1,5 +1,16 @@
 #include "unary-ops.h"
 
+#include <atomic>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <mutex>
+#include <string>
+#include <unordered_map>
+#include <vector>
+
+#include <sys/stat.h>
+
 static inline float op_abs(float x) {
     return fabsf(x);
 }
@@ -95,6 +106,179 @@ static inline float op_round(float x) {
 
 static inline float op_trunc(float x) {
     return truncf(x);
+}
+
+struct cpu_tanh_dump_info {
+    int         id;
+    std::string data_path;
+};
+
+static std::mutex                                      g_cpu_tanh_dump_mutex;
+static std::atomic<int>                                g_cpu_tanh_dump_next_id{0};
+static std::unordered_map<const ggml_tensor *, cpu_tanh_dump_info> g_cpu_tanh_dump_infos;
+
+static std::string cpu_tanh_dump_sanitize_name(const char * name) {
+    std::string result = name && name[0] ? name : "unnamed";
+    for (char & c : result) {
+        if (!(c >= 'a' && c <= 'z') && !(c >= 'A' && c <= 'Z') && !(c >= '0' && c <= '9') &&
+            c != '_' && c != '-' && c != '.') {
+            c = '_';
+        }
+    }
+    return result;
+}
+
+static bool cpu_tanh_dump_get_info(const ggml_tensor * dst, cpu_tanh_dump_info & info) {
+    const char * dump_dir = std::getenv("GGML_CPU_TANH_DUMP_DIR");
+    if (dump_dir == nullptr || dump_dir[0] == '\0') {
+        return false;
+    }
+
+    const char * filter = std::getenv("GGML_CPU_TANH_DUMP_FILTER");
+    if (filter && filter[0] && std::strstr(dst->name, filter) == nullptr) {
+        return false;
+    }
+
+    std::lock_guard<std::mutex> lock(g_cpu_tanh_dump_mutex);
+
+    auto it = g_cpu_tanh_dump_infos.find(dst);
+    if (it != g_cpu_tanh_dump_infos.end()) {
+        info = it->second;
+        return true;
+    }
+
+    mkdir(dump_dir, 0777);
+
+    const int id = g_cpu_tanh_dump_next_id.fetch_add(1);
+    const std::string name = cpu_tanh_dump_sanitize_name(dst->name);
+    const std::string prefix = std::string(dump_dir) + "/cpu_tanh_" + std::to_string(id) + "_" + name;
+    const std::string data_path = prefix + ".f32.bin";
+    const std::string meta_path = prefix + ".meta";
+
+    {
+        FILE * fp = std::fopen(data_path.c_str(), "wb");
+        if (fp == nullptr) {
+            fprintf(stderr, "%s: failed to open %s\n", __func__, data_path.c_str());
+            return false;
+        }
+        const int64_t nbytes = ggml_nelements(dst) * (int64_t) sizeof(float);
+        if (nbytes > 0) {
+            std::fseek(fp, nbytes - 1, SEEK_SET);
+            std::fputc(0, fp);
+        }
+        std::fclose(fp);
+    }
+
+    {
+        FILE * fp = std::fopen(meta_path.c_str(), "w");
+        if (fp != nullptr) {
+            fprintf(fp, "id=%d\n", id);
+            fprintf(fp, "name=%s\n", dst->name);
+            fprintf(fp, "op=TANH\n");
+            fprintf(fp, "stored_type=f32\n");
+            fprintf(fp, "original_type=%s\n", ggml_type_name(dst->type));
+            fprintf(fp, "ne=%lld,%lld,%lld,%lld\n",
+                    (long long) dst->ne[0], (long long) dst->ne[1], (long long) dst->ne[2], (long long) dst->ne[3]);
+            fprintf(fp, "nb=%zu,%zu,%zu,%zu\n", dst->nb[0], dst->nb[1], dst->nb[2], dst->nb[3]);
+            fprintf(fp, "elements=%lld\n", (long long) ggml_nelements(dst));
+            fprintf(fp, "data=%s\n", data_path.c_str());
+            std::fclose(fp);
+        }
+    }
+
+    auto inserted = g_cpu_tanh_dump_infos.emplace(dst, cpu_tanh_dump_info{id, data_path});
+    fprintf(stderr, "GGML_CPU_TANH_DUMP: #%d %s -> %s\n", id, dst->name, data_path.c_str());
+    info = inserted.first->second;
+    return true;
+}
+
+template <typename dst_t>
+static void cpu_tanh_dump_rows_as_f32_typed(
+        const ggml_compute_params * params,
+        const ggml_tensor * dst,
+        const cpu_tanh_dump_info * info) {
+    constexpr auto dst_to_f32 = type_conversion_table<dst_t>::to_f32;
+
+    GGML_TENSOR_LOCALS(int64_t, ne, dst, ne);
+    GGML_TENSOR_LOCALS(size_t,  nb, dst, nb);
+
+    GGML_ASSERT(nb0 == sizeof(dst_t));
+
+    const auto [ir0, ir1] = get_thread_range(params, dst);
+    if (ir0 >= ir1) {
+        return;
+    }
+
+    FILE * fp = std::fopen(info->data_path.c_str(), "r+b");
+    if (fp == nullptr) {
+        fprintf(stderr, "%s: failed to open %s\n", __func__, info->data_path.c_str());
+        return;
+    }
+
+    std::vector<float> row(ne0);
+    for (int64_t ir = ir0; ir < ir1; ++ir) {
+        const int64_t i03 = ir/(ne2*ne1);
+        const int64_t i02 = (ir - i03*ne2*ne1)/ne1;
+        const int64_t i01 = (ir - i03*ne2*ne1 - i02*ne1);
+
+        const dst_t * dst_ptr = (const dst_t *) ((const char *) dst->data + i03*nb3 + i02*nb2 + i01*nb1);
+        for (int64_t i00 = 0; i00 < ne0; ++i00) {
+            row[i00] = dst_to_f32(dst_ptr[i00]);
+        }
+
+        const int64_t offset = ir * ne0 * (int64_t) sizeof(float);
+        std::fseek(fp, offset, SEEK_SET);
+        std::fwrite(row.data(), sizeof(float), ne0, fp);
+    }
+
+    std::fclose(fp);
+}
+
+static void cpu_tanh_dump_rows_as_f32(const ggml_compute_params * params, const ggml_tensor * dst) {
+    cpu_tanh_dump_info info;
+    if (!cpu_tanh_dump_get_info(dst, info)) {
+        return;
+    }
+
+    switch (dst->type) {
+        case GGML_TYPE_F32:
+            cpu_tanh_dump_rows_as_f32_typed<float>(params, dst, &info);
+            break;
+        case GGML_TYPE_F16:
+            cpu_tanh_dump_rows_as_f32_typed<ggml_fp16_t>(params, dst, &info);
+            break;
+        case GGML_TYPE_BF16:
+            cpu_tanh_dump_rows_as_f32_typed<ggml_bf16_t>(params, dst, &info);
+            break;
+        default:
+            fprintf(stderr, "%s: unsupported tanh dump type: %s\n", __func__, ggml_type_name(dst->type));
+            break;
+    }
+}
+
+static void cpu_tanh_log(const ggml_compute_params * params, const ggml_tensor * dst) {
+    if (params->ith != 0) {
+        return;
+    }
+
+    const char * enabled = std::getenv("GGML_CPU_TANH_LOG");
+    if (enabled == nullptr || enabled[0] == '\0' || std::strcmp(enabled, "0") == 0) {
+        return;
+    }
+
+    const ggml_tensor * src0 = dst->src[0];
+
+    char log_buf[1024];
+    std::sprintf(log_buf,
+            "GGML_CPU_TANH_LOG: name=%s op=%s input_shape=[%lld,%lld,%lld,%lld] "
+            "output_shape=[%lld,%lld,%lld,%lld] input_dtype=%s output_dtype=%s\n",
+            dst->name,
+            ggml_unary_op_name(ggml_get_unary_op(dst)),
+            (long long) src0->ne[0], (long long) src0->ne[1], (long long) src0->ne[2], (long long) src0->ne[3],
+            (long long) dst->ne[0], (long long) dst->ne[1], (long long) dst->ne[2], (long long) dst->ne[3],
+            ggml_type_name(src0->type),
+            ggml_type_name(dst->type));
+    std::fputs(log_buf, stderr);
 }
 
 template <float (*op)(float), typename src0_t, typename dst_t>
@@ -251,7 +435,9 @@ void ggml_compute_forward_step(const ggml_compute_params * params, ggml_tensor *
 }
 
 void ggml_compute_forward_tanh(const ggml_compute_params * params, ggml_tensor * dst) {
+    cpu_tanh_log(params, dst);
     unary_op<op_tanh>(params, dst);
+    cpu_tanh_dump_rows_as_f32(params, dst);
 }
 
 void ggml_compute_forward_elu(const ggml_compute_params * params, ggml_tensor * dst) {

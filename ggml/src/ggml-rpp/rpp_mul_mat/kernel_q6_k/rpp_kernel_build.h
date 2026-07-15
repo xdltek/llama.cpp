@@ -379,7 +379,7 @@ static void rpp_matmul_q6k_tiled(rpp_kernel_context & ctx,
         }
     }
 
-    rppModuleLoad(&ctx.rppBinMod, "rpp_kernel/matmul_q6k.o");
+    rpp_module_load_once(ctx.rppBinMod, "rpp_kernel/matmul_q6k.o");
 
     const int Mtile = choose_m_tile(M, K, in_bytes_per_element, false);
 
@@ -535,8 +535,9 @@ static void rpp_matmul_q6k_tiled(rpp_kernel_context & ctx,
     }
 
     rppStreamEndCapture(ctx.kernelStream, &ctx.graph);
-    if (is_instantial) {
-        rppGraphInstantiate(&ctx.graphexec, ctx.graph, NULL, NULL, 0);
+    const std::string graph_key = rpp_join_function_name_and_args(__func__, M, K, N, weights_group, in_bytes_per_element, out_bytes_per_element);
+    if (rpp_graph_instantiate(ctx.graphexec, ctx.graph, graph_key.c_str(), is_instantial) != RPP_SUCCESS) {
+        throw std::runtime_error("rpp_graph_instantiate failed.");
     }
 }
 
@@ -576,7 +577,7 @@ static void rpp_matmul_q6k_pipeline(rpp_kernel_context & ctx,
     RPPdeviceptr devB_dequant_merged    = 0;
 
     RPPmodule cuMod;
-    rppModuleLoad(&ctx.rppBinMod, "rpp_kernel/matmul_q6k.o");
+    rpp_module_load_once(ctx.rppBinMod, "rpp_kernel/matmul_q6k.o");
 
     //----------------------------------------------------------------------------------------------------
     // in_lsb        [K/4][N]
@@ -968,8 +969,9 @@ static void rpp_matmul_q6k_pipeline(rpp_kernel_context & ctx,
 
     // End capture after all enqueued work is defined
     rppStreamEndCapture(ctx.kernelStream, &ctx.graph);
-    if (is_instantial) {
-        rppGraphInstantiate(&ctx.graphexec, ctx.graph, NULL, NULL, 0);
+    const std::string graph_key = rpp_join_function_name_and_args(__func__, M, K, N, weights_group, in_bytes_per_element, out_bytes_per_element, tile_ns);
+    if (rpp_graph_instantiate(ctx.graphexec, ctx.graph, graph_key.c_str(), is_instantial) != RPP_SUCCESS) {
+        throw std::runtime_error("rpp_graph_instantiate failed.");
     }
 }
 
@@ -1006,7 +1008,7 @@ static void rpp_matmul_q6k(rpp_kernel_context & ctx,
     RPPdeviceptr devB_dequant_merged    = 0;
 
     RPPmodule cuMod;
-    rppModuleLoad(&ctx.rppBinMod, "rpp_kernel/matmul_q6k.o");
+    rpp_module_load_once(ctx.rppBinMod, "rpp_kernel/matmul_q6k.o");
 
     //----------------------------------------------------------------------------------------------------
     // in_lsb        [K/4][N]
@@ -1269,8 +1271,9 @@ static void rpp_matmul_q6k(rpp_kernel_context & ctx,
 
     // End capture after all enqueued work is defined
     rppStreamEndCapture(ctx.kernelStream, &ctx.graph);
-    if (is_instantial) {
-        rppGraphInstantiate(&ctx.graphexec, ctx.graph, NULL, NULL, 0);
+    const std::string graph_key = rpp_join_function_name_and_args(__func__, M, K, N, weights_group, in_bytes_per_element, out_bytes_per_element, tile_ns);
+    if (rpp_graph_instantiate(ctx.graphexec, ctx.graph, graph_key.c_str(), is_instantial) != RPP_SUCCESS) {
+        throw std::runtime_error("rpp_graph_instantiate failed.");
     }
 }
 

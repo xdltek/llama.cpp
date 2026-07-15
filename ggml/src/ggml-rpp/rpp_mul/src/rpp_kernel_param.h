@@ -27,6 +27,11 @@ static inline int rpp_broadcast_axis(int C0, int H0, int W0, int C1, int H1, int
         return -1;
     }
 
+    // input1 scalar broadcast over C0, H0 and W0
+    if (C1 == 1 && H1 == 1 && W1 == 1 && C0 >= 1 && H0 >= 1 && W0 >= 1) {
+        return 8;
+    }
+
     // input1 broadcast cases (axis 0/1/2)
     if (C1 == 1 && H1 == H0 && W1 == W0 && C0 >= 1) {
         return 0;  // broadcast on C0

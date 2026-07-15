@@ -1,6 +1,8 @@
 
 #pragma once
 #include "rpp_drv_api.h"
+#include "ggml-rpp/rpp_kernel_ctx.h"
+#include "ggml-rpp/rpp_kernel_utils.h"
 
 #include <assert.h>
 #include <math.h>
@@ -9,11 +11,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+#include <array>
 #include <cassert>
 #include <cstdint>
-#include <cstring>
-#include <fstream>
 #include <iostream>
+#include <mutex>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -149,14 +152,10 @@ inline size_t q3xxs_vxm_nolut_codebook_bytes(int K, int N) {
 }
 
 struct q3xxs_vxm_nolut_lut_workspace {
-    static constexpr uint32_t qscale_lut_elems        = 16;
-    static constexpr uint32_t mag_lut_elems           = (uint32_t) kQ3xxsMagValues.size();
-    static constexpr uint32_t mat_lut_codes_per_entry = 4;
-    static constexpr uint32_t mat_lut_rows            = 1u << (3u * mat_lut_codes_per_entry);
-    static constexpr uint32_t mat_lut_cols            = mat_lut_codes_per_entry;
-    static constexpr uint32_t qscale_lut_bytes        = qscale_lut_elems * (uint32_t) sizeof(uint16_t);
-    static constexpr uint32_t mag_lut_bytes           = mag_lut_elems * (uint32_t) sizeof(uint16_t);
-    static constexpr uint32_t mat_lut_bytes           = mat_lut_rows * mat_lut_cols * (uint32_t) sizeof(uint16_t);
+    static constexpr uint32_t qscale_lut_elems = 16;
+    static constexpr uint32_t mag_lut_elems    = (uint32_t) kQ3xxsMagValues.size();
+    static constexpr uint32_t qscale_lut_bytes = qscale_lut_elems * (uint32_t) sizeof(uint16_t);
+    static constexpr uint32_t mag_lut_bytes    = mag_lut_elems * (uint32_t) sizeof(uint16_t);
 };
 
 struct q3xxs_vxm_nolut_sram_io {
@@ -195,76 +194,69 @@ struct q3xxs_vxm_nolut_sram_io {
     RPPdeviceptr sramB_super_scale    = 0;
     RPPdeviceptr sramB_qscale_lut     = 0;
     RPPdeviceptr sramB_mag_lut        = 0;
-    RPPdeviceptr sramB_mat_lut        = 0;
     RPPdeviceptr sramB_scale          = 0;
 };
 
-struct q3xxs_vxm_nolut_workspace_ptrs {
-    RPPdeviceptr base        = 0;
-    RPPdeviceptr qscale_lut  = 0;
-    RPPdeviceptr mag_lut     = 0;
-    RPPdeviceptr mat_lut     = 0;
-    uint32_t     total_bytes = 0;
-};
+static RPPdeviceptr q3xxs_vxm_nolut_prepare_lut_workspace(rpp_kernel_context & ctx) {
+    static std::mutex   mutex;
+    static RPPdeviceptr kernel_lut_workspace       = 0;
+    static size_t       kernel_lut_workspace_bytes = 0;
 
-static q3xxs_vxm_nolut_workspace_ptrs q3xxs_vxm_nolut_prepare_lut_workspace(rpp_kernel_context & ctx) {
-    q3xxs_vxm_nolut_workspace_ptrs out{};
-    const size_t                   off_qscale = 0;
+    const size_t off_qscale  = 0;
     const size_t off_mag     = align_up(off_qscale + (size_t) q3xxs_vxm_nolut_lut_workspace::qscale_lut_bytes, 64);
-    const size_t off_mat     = align_up(off_mag + (size_t) q3xxs_vxm_nolut_lut_workspace::mag_lut_bytes, 64);
-    const size_t total_bytes = align_up(off_mat + (size_t) q3xxs_vxm_nolut_lut_workspace::mat_lut_bytes, 64);
+    const size_t total_bytes = align_up(off_mag + (size_t) q3xxs_vxm_nolut_lut_workspace::mag_lut_bytes, 64);
 
-    if (ctx.dev_workspace == 0) {
-        if (rtMalloc((void **) &ctx.dev_workspace, total_bytes) != rtSuccess) {
-            throw std::runtime_error("Q3XXS NoLUT LUT workspace allocation failed");
+    std::lock_guard<std::mutex> lock(mutex);
+    if (kernel_lut_workspace == 0) {
+        if (rtMalloc((void **) &kernel_lut_workspace, total_bytes) != rtSuccess) {
+            throw std::runtime_error("Q3XXS NoLUT LUT shared workspace allocation failed");
         }
-    }
+        kernel_lut_workspace_bytes = total_bytes;
 
-    out.base        = ctx.dev_workspace;
-    out.qscale_lut  = out.base + (RPPdeviceptr) off_qscale;
-    out.mag_lut     = out.base + (RPPdeviceptr) off_mag;
-    out.mat_lut     = out.base + (RPPdeviceptr) off_mat;
-    out.total_bytes = (uint32_t) total_bytes;
+        RPPdeviceptr dev_qscale_lut = kernel_lut_workspace + (RPPdeviceptr) off_qscale;
+        RPPdeviceptr dev_mag_lut    = kernel_lut_workspace + (RPPdeviceptr) off_mag;
 
-    std::array<uint16_t, q3xxs_vxm_nolut_lut_workspace::qscale_lut_elems> qscale_lut = {};
-    for (uint32_t i = 0; i < qscale_lut.size(); ++i) {
-        const float lut_val = (0.5f + (float) i) * 0.5f;
-        qscale_lut[i]       = float_to_bf16_rne(lut_val);
-    }
-
-    std::array<uint16_t, q3xxs_vxm_nolut_lut_workspace::mag_lut_elems> mag_lut = {};
-    for (uint32_t i = 0; i < mag_lut.size(); ++i) {
-        mag_lut[i] = float_to_bf16_rne(kQ3xxsMagValues[i]);
-    }
-
-    std::vector<uint16_t> mat_lut(
-        (size_t) q3xxs_vxm_nolut_lut_workspace::mat_lut_rows * (size_t) q3xxs_vxm_nolut_lut_workspace::mat_lut_cols, 0);
-    for (uint32_t packed = 0; packed < q3xxs_vxm_nolut_lut_workspace::mat_lut_rows; ++packed) {
-        for (uint32_t u = 0; u < q3xxs_vxm_nolut_lut_workspace::mat_lut_cols; ++u) {
-            const uint8_t code = (uint8_t) ((packed >> (3u * u)) & 0x7u);
-            mat_lut[(size_t) packed * (size_t) q3xxs_vxm_nolut_lut_workspace::mat_lut_cols + (size_t) u] =
-                float_to_bf16_rne(kQ3xxsMagValues[code]);
+        std::array<uint16_t, q3xxs_vxm_nolut_lut_workspace::qscale_lut_elems> qscale_lut = {};
+        for (uint32_t i = 0; i < qscale_lut.size(); ++i) {
+            const float lut_val = (0.5f + (float) i) * 0.5f;
+            qscale_lut[i]       = float_to_bf16_rne(lut_val);
         }
+
+        std::array<uint16_t, q3xxs_vxm_nolut_lut_workspace::mag_lut_elems> mag_lut = {};
+        for (uint32_t i = 0; i < mag_lut.size(); ++i) {
+            mag_lut[i] = float_to_bf16_rne(kQ3xxsMagValues[i]);
+        }
+
+        rtMemcpy((void *) dev_qscale_lut, qscale_lut.data(), q3xxs_vxm_nolut_lut_workspace::qscale_lut_bytes,
+                 rtMemcpyHostToDevice);
+        rtMemcpy((void *) dev_mag_lut, mag_lut.data(), q3xxs_vxm_nolut_lut_workspace::mag_lut_bytes,
+                 rtMemcpyHostToDevice);
+    } else if (kernel_lut_workspace_bytes != total_bytes) {
+        throw std::runtime_error("Q3XXS NoLUT shared LUT workspace size mismatch");
     }
 
-    rtMemcpy((void *) out.qscale_lut, qscale_lut.data(), q3xxs_vxm_nolut_lut_workspace::qscale_lut_bytes,
-             rtMemcpyHostToDevice);
-    rtMemcpy((void *) out.mag_lut, mag_lut.data(), q3xxs_vxm_nolut_lut_workspace::mag_lut_bytes, rtMemcpyHostToDevice);
-    rtMemcpy((void *) out.mat_lut, mat_lut.data(), q3xxs_vxm_nolut_lut_workspace::mat_lut_bytes, rtMemcpyHostToDevice);
-    return out;
+    RPPdeviceptr dev_lut_workspace = ctx.dev_workspace;
+    if (dev_lut_workspace == 0) {
+        dev_lut_workspace = kernel_lut_workspace;
+        ctx.dev_workspace = dev_lut_workspace;
+    } else if (dev_lut_workspace != kernel_lut_workspace) {
+        rtMemcpy((void *) dev_lut_workspace, (const void *) kernel_lut_workspace, total_bytes, rtMemcpyDeviceToDevice);
+    }
+
+    return dev_lut_workspace;
 }
 
-static inline void q3xxs_vxm_nolut_copy_lut_workspace_to_sram(RPPdeviceptr                           sram_qscale_lut,
-                                                              RPPdeviceptr                           sram_mag_lut,
-                                                              RPPdeviceptr                           sram_mat_lut,
-                                                              const q3xxs_vxm_nolut_workspace_ptrs & lut_ws,
-                                                              RPPstream                              stream) {
-    rtMemcpyAsync((void *) sram_qscale_lut, (const void *) lut_ws.qscale_lut,
+static inline void q3xxs_vxm_nolut_copy_lut_workspace_to_sram(RPPdeviceptr sram_qscale_lut,
+                                                              RPPdeviceptr sram_mag_lut,
+                                                              RPPdeviceptr dev_lut_workspace,
+                                                              RPPstream    stream) {
+    const size_t off_qscale = 0;
+    const size_t off_mag =
+        align_up(off_qscale + (size_t) q3xxs_vxm_nolut_lut_workspace::qscale_lut_bytes, 64);
+    rtMemcpyAsync((void *) sram_qscale_lut, (const void *) (dev_lut_workspace + (RPPdeviceptr) off_qscale),
                   q3xxs_vxm_nolut_lut_workspace::qscale_lut_bytes, rtMemcpyDeviceToSram, stream);
-    rtMemcpyAsync((void *) sram_mag_lut, (const void *) lut_ws.mag_lut, q3xxs_vxm_nolut_lut_workspace::mag_lut_bytes,
-                  rtMemcpyDeviceToSram, stream);
-    rtMemcpyAsync((void *) sram_mat_lut, (const void *) lut_ws.mat_lut, q3xxs_vxm_nolut_lut_workspace::mat_lut_bytes,
-                  rtMemcpyDeviceToSram, stream);
+    rtMemcpyAsync((void *) sram_mag_lut, (const void *) (dev_lut_workspace + (RPPdeviceptr) off_mag),
+                  q3xxs_vxm_nolut_lut_workspace::mag_lut_bytes, rtMemcpyDeviceToSram, stream);
 }
 
 static void q3xxs_vxm_nolut_prepare_sram_io(rpp_kernel_context &      ctx,
@@ -322,8 +314,7 @@ static void q3xxs_vxm_nolut_prepare_sram_io(rpp_kernel_context &      ctx,
     io.sramB_qscale_lut     = io.sramB_codebook_nolut + (RPPdeviceptr) round_up((int) io.size_weights_total);
     io.sramB_mag_lut =
         io.sramB_qscale_lut + (RPPdeviceptr) round_up((int) q3xxs_vxm_nolut_lut_workspace::qscale_lut_bytes);
-    io.sramB_mat_lut = io.sramB_mag_lut + (RPPdeviceptr) round_up((int) q3xxs_vxm_nolut_lut_workspace::mag_lut_bytes);
-    io.sramB_scale   = io.sramB_mat_lut + (RPPdeviceptr) round_up((int) q3xxs_vxm_nolut_lut_workspace::mat_lut_bytes);
+    io.sramB_scale   = io.sramB_mag_lut + (RPPdeviceptr) round_up((int) q3xxs_vxm_nolut_lut_workspace::mag_lut_bytes);
     io.total_sram_bytes =
         (uint32_t) ((io.sramB_scale + (RPPdeviceptr) round_up((int) io.sizeB_scale_scratch_total)) - io.sram_base);
 
@@ -342,7 +333,6 @@ static void q3xxs_vxm_nolut_prepare_sram_io(rpp_kernel_context &      ctx,
         ctx.dev_in.emplace_back(io.sramB_super_scale);
         ctx.dev_in.emplace_back(io.sramB_qscale_lut);
         ctx.dev_in.emplace_back(io.sramB_mag_lut);
-        ctx.dev_in.emplace_back(io.sramB_mat_lut);
         ctx.dev_in.emplace_back(io.sramB_scale);
 
         if (out_bytes_per_element == (int) sizeof(float)) {

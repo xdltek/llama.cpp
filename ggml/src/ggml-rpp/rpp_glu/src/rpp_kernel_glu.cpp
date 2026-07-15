@@ -6,25 +6,6 @@ static int ggml_rpp_glu_seq_len(ggml_tensor * dst, ggml_rpp_node * node) {
     return dst->ne[node->seq_len_index];
 }
 
-static ggml_rpp_node * ggml_rpp_find_glu_node(ggml_backend_rpp_context & ctx, ggml_tensor * dst) {
-    for (auto & graph_iter : ctx.gglm_graphs) {
-        ggml_rpp_cgraph * rpp_graph_tmp = ctx.rpp_graphs[graph_iter].get();
-        if (!rpp_graph_tmp) {
-            continue;
-        }
-        for (auto & node_iter : rpp_graph_tmp->rpp_nodes) {
-            if (node_iter.first != dst && node_iter.first->op == GGML_OP_GLU) {
-                auto & node_vec = node_iter.second;
-                for (size_t i = 0; i < node_vec.size(); i++) {
-                    auto cur_node = node_vec[i].get();
-                    return cur_node;
-                }
-            }
-        }
-    }
-    return nullptr;
-}
-
 static bool ggml_rpp_create_kernel_swiglu(ggml_backend_rpp_context & ctx,
                                           ggml_rpp_node *            rpp_base_node,
                                           ggml_tensor *              dst,
@@ -70,14 +51,6 @@ static bool ggml_rpp_create_kernel_swiglu(ggml_backend_rpp_context & ctx,
         rpp_node->binding_io_buffers.emplace_back(inputs_1_buf);
     }
 
-    // find first glu_node, and all rms_norm kernel will shared the same workspace
-    auto ori_rpp_node = ggml_rpp_find_glu_node(ctx, dst);
-    if (ori_rpp_node) {
-        auto ori_glu_node = static_cast<rpp_kernel_glu *>(ori_rpp_node);
-        rpp_node->init_workspace(ori_glu_node->kernel_ctx->dev_workspace);
-    } else {
-        rpp_node->init_workspace(ctx);
-    }
     // build kernel
     const int i_type_size = ggml_rpp_get_io_type_size(ctx, dst->src[0], 0);
     const int o_type_size = ggml_rpp_get_io_type_size(ctx, dst, 1);
@@ -123,7 +96,7 @@ static bool ggml_rpp_create_kernel_geglu_erf(ggml_backend_rpp_context & ctx,
 
     // set io buffer info to rpp_node
     void * inputs_0_buf = src0->data;
-    void * inputs_1_buf = src1->data;
+    void * inputs_1_buf = src1 ? src1->data : nullptr;
     rpp_node->kernel_ctx->dev_in.emplace_back((RPPdeviceptr) inputs_0_buf);
     rpp_node->kernel_ctx->dev_out.emplace_back((RPPdeviceptr) (dst->data));
     rpp_node->binding_i_buffers.emplace(dst->src[0], inputs_0_buf);
@@ -136,18 +109,17 @@ static bool ggml_rpp_create_kernel_geglu_erf(ggml_backend_rpp_context & ctx,
         rpp_node->binding_io_buffers.emplace_back(inputs_1_buf);
     }
 
-    // find first glu_node, and all rms_norm kernel will shared the same workspace
-    auto ori_rpp_node = ggml_rpp_find_glu_node(ctx, dst);
-    if (ori_rpp_node) {
-        auto ori_glu_node = static_cast<rpp_kernel_glu *>(ori_rpp_node);
-        rpp_node->init_workspace(ori_glu_node->kernel_ctx->dev_workspace);
-    } else {
-        rpp_node->init_workspace(ctx);
-    }
     const int i_type_size = ggml_rpp_get_io_type_size(ctx, dst->src[0], 0);
     const int o_type_size = ggml_rpp_get_io_type_size(ctx, dst, 1);
     // build kernel
+    int gelu_variant = 0;
+    if (ggml_get_glu_op(dst) == GGML_GLU_OP_GEGLU_ERF) {
+        gelu_variant = 1;
+    } else if (ggml_get_glu_op(dst) == GGML_GLU_OP_GEGLU_QUICK) {
+        gelu_variant = 2;
+    }
     kernel_geglu_erf::rpp_gelu_build(*(rpp_node->kernel_ctx.get()), mode, C, H, W, 1, i_type_size, o_type_size,
+                                     gelu_variant,
                                      rpp_node->is_instantial);
     return true;
 }
@@ -175,7 +147,9 @@ static bool ggml_rpp_create_kernel_dispatch(ggml_backend_rpp_context & ctx,
         case GGML_GLU_OP_SWIGLU:
             ret = ggml_rpp_create_kernel_swiglu(ctx, rpp_node, dst);
             break;
+        case GGML_GLU_OP_GEGLU:
         case GGML_GLU_OP_GEGLU_ERF:
+        case GGML_GLU_OP_GEGLU_QUICK:
             ret = ggml_rpp_create_kernel_geglu_erf(ctx, rpp_node, dst);
             break;
         default:
@@ -278,7 +252,9 @@ static bool ggml_rpp_launch_kernel(ggml_backend_rpp_context & ctx, ggml_tensor *
                 }
             }
             break;
+        case GGML_GLU_OP_GEGLU:
         case GGML_GLU_OP_GEGLU_ERF:
+        case GGML_GLU_OP_GEGLU_QUICK:
             {
                 try {
                     RPP_LAUNCH_KERNEL(rpp_node->kernel_ctx->graphexec, ctx.stream());

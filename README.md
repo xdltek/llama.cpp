@@ -68,8 +68,8 @@ cmake .. \
     -DGGML_RPP_USE_BF16=ON \
     -DGGML_RPP_USE_DFS=ON \
     -DLLAMA_CURL=OFF \
-    -DCMAKE_BUILD_TYPE=Debug \
-    -DLLAMA_BUILD_TESTS=OFF
+    -DCMAKE_BUILD_TYPE=Debug
+
 make -j$(nproc)
 ```
 
@@ -151,11 +151,11 @@ OpenAI-compatible REST API:
 POST /v1/chat/completions
 ```
 
----
-
 #  FAQ
 
 \- [llama-server Web UI not display](/FAQ/server-ui-not-display.md)
+
+---
 
 # Original llama.cpp Documentation
 
@@ -398,6 +398,7 @@ Instructions for adding support for new models: [HOWTO-add-model.md](docs/develo
 | [Vulkan](docs/build.md#vulkan) | GPU |
 | [CANN](docs/build.md#cann) | Ascend NPU |
 | [OpenCL](docs/backend/OPENCL.md) | Adreno GPU |
+| [RPP](docs/backend/RPP/rpp_overall_architecture.md) | RPP devices |
 | [IBM zDNN](docs/backend/zDNN.md) | IBM Z & LinuxONE |
 | [WebGPU](docs/build.md#webgpu) | All |
 | [RPC](https://github.com/ggml-org/llama.cpp/tree/master/tools/rpc) | All |

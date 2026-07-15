@@ -13,6 +13,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <mutex>
 #include <stdexcept>
 #include <vector>
 
@@ -67,6 +68,10 @@ static void q2xs_prepare_lookup_tables(rpp_kernel_context & ctx,
                                        RPPdeviceptr &       devB_qscale_lut,
                                        RPPdeviceptr &       devB_codebook_lut,
                                        RPPdeviceptr &       devB_sign_lut) {
+    static std::mutex   mutex;
+    static RPPdeviceptr kernel_lut_workspace       = 0;
+    static size_t       kernel_lut_workspace_bytes = 0;
+
     auto align_up = [](size_t x, size_t a) -> size_t {
         return ((x + a - 1) / a) * a;
     };
@@ -76,40 +81,52 @@ static void q2xs_prepare_lookup_tables(rpp_kernel_context & ctx,
     const size_t off_sign_lut     = align_up(off_codebook_lut + (size_t) codebook_lut_bytes, 64);
     const size_t workspace_bytes  = align_up(off_sign_lut + (size_t) sign_lut_bytes, 64);
 
-    // Workspace holds q2xs LUTs generated on host:
-    // qscale LUT (for super-scale), codebook LUT (iq2xs_grid), and sign LUT (reversed-bit ksigns_iq2xs).
-    // Reuse the shared workspace to avoid invalidating pointers captured by other kernels.
+    std::lock_guard<std::mutex> lock(mutex);
+    if (kernel_lut_workspace == 0) {
+        if (rtMalloc((void **) &kernel_lut_workspace, workspace_bytes) != rtSuccess) {
+            throw std::runtime_error("Q2XS rtMalloc failed for shared LUT workspace");
+        }
+        kernel_lut_workspace_bytes = workspace_bytes;
+
+        RPPdeviceptr devB_qscale_lut_shared  = kernel_lut_workspace + (RPPdeviceptr) off_qscale_lut;
+        RPPdeviceptr devB_codebook_lut_shared = kernel_lut_workspace + (RPPdeviceptr) off_codebook_lut;
+        RPPdeviceptr devB_sign_lut_shared     = kernel_lut_workspace + (RPPdeviceptr) off_sign_lut;
+
+        std::array<uint16_t, 16> qscale_lut = {};
+        for (int i = 0; i < (int) qscale_lut.size(); ++i) {
+            const float lut_val = (0.5f + (float) i) * 0.25f;
+            qscale_lut[i]       = float_to_bf16_rne(lut_val);
+        }
+
+        std::array<uint64_t, 512> codebook_lut = {};
+        // q2xs uses its dedicated 512-entry iq2xs grid table (same packed 8x-u8 format).
+        std::memcpy(codebook_lut.data(), iq2xs_grid_local, sizeof(codebook_lut));
+
+        std::array<uint8_t, 128> sign_lut = {};
+        for (int i = 0; i < (int) sign_lut.size(); ++i) {
+            sign_lut[i] = q2xs_reverse_bits_u8(ksigns_iq2xs_local[i]);
+        }
+
+        rtMemcpy((void *) devB_qscale_lut_shared, qscale_lut.data(), qscale_lut_bytes, rtMemcpyHostToDevice);
+        rtMemcpy((void *) devB_codebook_lut_shared, codebook_lut.data(), codebook_lut_bytes, rtMemcpyHostToDevice);
+        rtMemcpy((void *) devB_sign_lut_shared, sign_lut.data(), sign_lut_bytes, rtMemcpyHostToDevice);
+    } else if (kernel_lut_workspace_bytes != workspace_bytes) {
+        throw std::runtime_error("Q2XS shared LUT workspace size mismatch");
+    }
+
     RPPdeviceptr dev_lut_workspace = ctx.dev_workspace;
     if (dev_lut_workspace == 0) {
-        if (rtMalloc((void **) &dev_lut_workspace, workspace_bytes) != rtSuccess) {
-            throw std::runtime_error("Q2XS rtMalloc failed for LUT workspace");
-        }
+        dev_lut_workspace = kernel_lut_workspace;
         ctx.dev_workspace = dev_lut_workspace;
+    } else if (dev_lut_workspace != kernel_lut_workspace) {
+        rtMemcpy((void *) dev_lut_workspace, (const void *) kernel_lut_workspace, workspace_bytes,
+                 rtMemcpyDeviceToDevice);
     }
 
     RPPdeviceptr base = dev_lut_workspace;
     devB_qscale_lut   = base + (RPPdeviceptr) off_qscale_lut;
     devB_codebook_lut = base + (RPPdeviceptr) off_codebook_lut;
     devB_sign_lut     = base + (RPPdeviceptr) off_sign_lut;
-
-    std::array<uint16_t, 16> qscale_lut = {};
-    for (int i = 0; i < (int) qscale_lut.size(); ++i) {
-        const float lut_val = (0.5f + (float) i) * 0.25f;
-        qscale_lut[i]       = float_to_bf16_rne(lut_val);
-    }
-
-    std::array<uint64_t, 512> codebook_lut = {};
-    // q2xs uses its dedicated 512-entry iq2xs grid table (same packed 8x-u8 format).
-    std::memcpy(codebook_lut.data(), iq2xs_grid_local, sizeof(codebook_lut));
-
-    std::array<uint8_t, 128> sign_lut = {};
-    for (int i = 0; i < (int) sign_lut.size(); ++i) {
-        sign_lut[i] = q2xs_reverse_bits_u8(ksigns_iq2xs_local[i]);
-    }
-
-    rtMemcpy((void *) devB_qscale_lut, qscale_lut.data(), qscale_lut_bytes, rtMemcpyHostToDevice);
-    rtMemcpy((void *) devB_codebook_lut, codebook_lut.data(), codebook_lut_bytes, rtMemcpyHostToDevice);
-    rtMemcpy((void *) devB_sign_lut, sign_lut.data(), sign_lut_bytes, rtMemcpyHostToDevice);
 }
 
 static void rpp_matmul_q2xs_build(rpp_kernel_context & ctx,
@@ -167,7 +184,7 @@ static void rpp_matmul_q2xs_build(rpp_kernel_context & ctx,
 
     rppStreamBeginCapture(ctx.kernelStream, RPP_STREAM_CAPTURE_MODE_GLOBAL);
     // Native q2xs kernels + q2xs local block/param helpers.
-    rppModuleLoad(&ctx.rppBinMod, "rpp_kernel/matmul_q2xs.o");
+    rpp_module_load_once(ctx.rppBinMod, "rpp_kernel/matmul_q2xs.o");
 
     const int sizeA0 = M * K * in_bytes_per_element;
     const int sizeA1 = M * K * (int) sizeof(rpp::bfloat16);
@@ -329,8 +346,9 @@ static void rpp_matmul_q2xs_build(rpp_kernel_context & ctx,
     }
 
     rppStreamEndCapture(ctx.kernelStream, &ctx.graph);
-    if (is_instantial) {
-        rppGraphInstantiate(&ctx.graphexec, ctx.graph, NULL, NULL, 0);
+    const std::string graph_key = rpp_join_function_name_and_args(__func__, M, K, N, weights_group, in_bytes_per_element, out_bytes_per_element);
+    if (rpp_graph_instantiate(ctx.graphexec, ctx.graph, graph_key.c_str(), is_instantial) != RPP_SUCCESS) {
+        throw std::runtime_error("rpp_graph_instantiate failed.");
     }
 }
 

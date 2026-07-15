@@ -16,6 +16,7 @@ inline const std::vector<std::string> g_large_power_kernels = {
     "matmul_tn3_f16_f32_f16",
     "matmul_tn4_f16_f32_f16",
     "matmul_tn4_f16_f32_f32",
+    "matrix_mul_tn4_f16_f16_dyn_v1",
 };
 
 inline int Kernel2Frequency(const std::string & name, int threads, int freq2, int freq1, int freq0) {

@@ -82,7 +82,7 @@ inline void rpp_pool_2d_build(rpp_kernel_context & ctx,
     }
 
     rppStreamBeginCapture(ctx.kernelStream, RPP_STREAM_CAPTURE_MODE_GLOBAL);
-    rppModuleLoad(&ctx.rppBinMod, "rpp_kernel/pool_2d.o");
+    rpp_module_load_once(ctx.rppBinMod, "rpp_kernel/pool_2d.o");
 
     rtMemcpyAsync((void *) sram_in_f32, (const void *) dev_in, size_in, rtMemcpyDeviceToSram, ctx.kernelStream);
 
@@ -222,9 +222,10 @@ inline void rpp_pool_2d_build(rpp_kernel_context & ctx,
     rtMemcpyAsync((void *) dev_out, (const void *) sram_out_f32, size_out, rtMemcpySramToDevice, ctx.kernelStream);
 
     rppStreamEndCapture(ctx.kernelStream, &ctx.graph);
-    if (is_instantial) {
-        if (rppGraphInstantiate(&ctx.graphexec, ctx.graph, NULL, NULL, 0) != RPP_SUCCESS) {
-            throw std::runtime_error("POOL_2D rppGraphInstantiate failed");
-        }
+    const std::string graph_key =
+        rpp_join_function_name_and_args(__func__, in_w, in_h, channels, out_w, out_h, k0, k1, s0, s1,
+                                        in_bytes_per_element, out_bytes_per_element);
+    if (rpp_graph_instantiate(ctx.graphexec, ctx.graph, graph_key.c_str(), is_instantial) != RPP_SUCCESS) {
+        throw std::runtime_error("POOL_2D rpp_graph_instantiate failed");
     }
 }

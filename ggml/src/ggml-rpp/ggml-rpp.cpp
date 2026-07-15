@@ -9,8 +9,11 @@
 #include "ggml.h"
 #include "llama.h"
 #include "rpp_add/rpp_add.h"
+#include "rpp_clamp/rpp_clamp.h"
 #include "rpp_common.h"
+#include "rpp_concat/rpp_concat.h"
 #include "rpp_cont/rpp_cont.h"
+#include "rpp_conv2d/rpp_conv2d.h"
 #include "rpp_cpy/rpp_cpy.h"
 #include "rpp_div/rpp_div.h"
 #include "rpp_drv_api.h"
@@ -31,12 +34,16 @@
 #include "rpp_runtime.h"
 #include "rpp_scale/rpp_scale.h"
 #include "rpp_set_rows/rpp_set_rows.h"
+#include "rpp_tanh/rpp_tanh.h"
 #include "rpp_unary/rpp_unary.h"
 
+#include <errno.h>
 #include <float.h>
+#include <fcntl.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <array>
@@ -57,6 +64,8 @@
 #include <unordered_map>
 #include <vector>
 
+thread_local uint32_t ggml_rpp_trace_id_current = 0;
+
 void rpp_kernel_cgraph::add_child_graph(ggml_rpp_node * rpp_node) {
     GGML_ASSERT(rpp_node);
     rpp_nodes.emplace_back(rpp_node);
@@ -76,10 +85,7 @@ void rpp_kernel_cgraph::update_child_graph(std::unordered_map<ggml_tensor *, ggm
         GGML_ASSERT(iter != cur_rpp_nodes.end());
         if (iter->second != old_node) {
             auto new_node = static_cast<rpp_node_kernel *>(iter->second);
-            if (new_node->kernel_ctx->graphexec == nullptr) {
-                RPP_CHECK(rppGraphInstantiate(&(new_node->kernel_ctx->graphexec), new_node->kernel_ctx->graph, nullptr,
-                                              nullptr, 0));
-            }
+            GGML_ASSERT(new_node->kernel_ctx->graphexec);
             // Keep wrapper handles aligned with the real per-kernel context handles.
             graph        = new_node->kernel_ctx->graph;
             graphexec    = new_node->kernel_ctx->graphexec;
@@ -95,8 +101,6 @@ void rpp_kernel_cgraph::update_child_graph(std::unordered_map<ggml_tensor *, ggm
         auto iter        = cur_rpp_nodes.find(ggml_tensor);
         GGML_ASSERT(iter != cur_rpp_nodes.end());
         if (iter->second != rpp_node) {
-            // Shared parent graphexec: swap child binding via rppGraphInstantiateWithParams(CHILD_EXEC) +
-            // rppGraphExecUpdateChildGraphExec only (no rppGraphUpdateChildGraph / rppGraphExecUpdate).
             ggml_rpp_node * new_rpp_node = iter->second;
             ggml_rpp_node * old_rpp_node = rpp_node;
 
@@ -123,6 +127,7 @@ void rpp_kernel_cgraph::update_child_graph(std::unordered_map<ggml_tensor *, ggm
 }
 
 void rpp_kernel_cgraph::graph_instantiate() {
+    TRACE_SCOPE_GUARD(ggml_rpp_trace_id_current, "rpp_kernel_cgraph_graph_instantiate");
     if (rpp_nodes.empty()) {
         return;
     }
@@ -131,7 +136,21 @@ void rpp_kernel_cgraph::graph_instantiate() {
 
     if (is_shared) {
         if (graphexec == nullptr) {
-            RPP_CHECK(rppGraphInstantiate(&graphexec, graph, nullptr, nullptr, 0));
+            {
+                TRACE_SCOPE_GUARD(ggml_rpp_trace_id_current, "rppGraphInstantiate");
+                RPP_CHECK(rppGraphInstantiate(&graphexec, graph, nullptr, nullptr, 0));
+            }
+            {
+                // Graph memory is released after instantiate; clear handle to avoid
+                // double-free in ~rpp_kernel_cgraph.
+                TRACE_SCOPE_GUARD(ggml_rpp_trace_id_current, "rppGraphDestroy");
+                RPP_CHECK(rppGraphDestroy(graph));
+                graph = nullptr;
+            }
+            {
+                TRACE_SCOPE_GUARD(ggml_rpp_trace_id_current, "rppGraphExecFinalize");
+                RPP_CHECK(rppGraphExecFinalize(graphexec, nullptr));
+            }
         }
         return;
     }
@@ -139,14 +158,6 @@ void rpp_kernel_cgraph::graph_instantiate() {
     GGML_ASSERT(rpp_node->rpp_type == ggml_rpp_node::RPP_NODE_TYPE_KERNEL);
     auto kernel_node = static_cast<rpp_node_kernel *>(rpp_node);
     GGML_ASSERT(kernel_node->kernel_ctx);
-    if (rpp_node->cur_ggml_tensor->op == GGML_OP_MUL_MAT_ID &&
-        kernel_node->op == rpp_node_kernel::RPP_OP_EXPERT_FORWARD) {
-        return;
-    }
-    if (kernel_node->kernel_ctx->graphexec == nullptr) {
-        RPP_CHECK(rppGraphInstantiate(&(kernel_node->kernel_ctx->graphexec), kernel_node->kernel_ctx->graph, nullptr,
-                                      nullptr, 0));
-    }
     // Keep wrapper handles aligned with the real per-kernel context handles.
     graph     = kernel_node->kernel_ctx->graph;
     graphexec = kernel_node->kernel_ctx->graphexec;
@@ -846,17 +857,224 @@ struct ggml_rpp_weights_cache_index_entry {
     uint64_t input_fingerprint;
 };
 
+struct ggml_rpp_weights_cache_staging_buffer {
+    void *    ptr          = nullptr;
+    size_t    capacity     = 0;
+    bool      in_use       = false;
+    bool      copy_pending = false;
+    rtEvent_t copy_done    = nullptr;
+};
+
 struct ggml_rpp_weights_cache_state {
     std::mutex                                                          mutex;
     bool                                                                initialized = false;
     bool                                                                enabled     = false;
     std::string                                                         file_path;
+    int                                                                 fd = -1;
     std::unordered_map<std::string, ggml_rpp_weights_cache_index_entry> index;
+    std::array<ggml_rpp_weights_cache_staging_buffer, 2>                staging_buffers;
+    size_t                                                              staging_next = 0;
+
+    ~ggml_rpp_weights_cache_state() {
+        for (ggml_rpp_weights_cache_staging_buffer & buffer : staging_buffers) {
+            if (buffer.copy_pending && buffer.copy_done != nullptr) {
+                RPP_CHECK(rtEventSynchronize(buffer.copy_done));
+            }
+            if (buffer.ptr != nullptr) {
+                rtFreeHost(buffer.ptr);
+                buffer.ptr = nullptr;
+            }
+            if (buffer.copy_done != nullptr) {
+                RPP_CHECK(rtEventDestroy(buffer.copy_done));
+                buffer.copy_done = nullptr;
+            }
+        }
+        if (fd >= 0) {
+            close(fd);
+            fd = -1;
+        }
+    }
 };
 
 static ggml_rpp_weights_cache_state & ggml_rpp_weights_cache_get_state() {
     static ggml_rpp_weights_cache_state cache_state;
     return cache_state;
+}
+
+static bool ggml_rpp_weights_cache_open_fd_locked(ggml_rpp_weights_cache_state & cache_state) {
+    if (cache_state.fd >= 0) {
+        return true;
+    }
+
+    cache_state.fd = open(cache_state.file_path.c_str(), O_RDONLY | O_CLOEXEC);
+    if (cache_state.fd < 0) {
+        GGML_LOG_ERROR("%s: failed to open cache file for reading: %s\n", __func__, cache_state.file_path.c_str());
+        return false;
+    }
+    return true;
+}
+
+static bool ggml_rpp_weights_cache_pread_full(int fd, void * dst, size_t size, uint64_t offset) {
+    uint8_t * out = (uint8_t *) dst;
+    size_t    done = 0;
+    while (done < size) {
+        const uint64_t cur_offset = offset + done;
+        if (cur_offset > (uint64_t) std::numeric_limits<off_t>::max()) {
+            return false;
+        }
+
+        const size_t  to_read = std::min(size - done, (size_t) std::numeric_limits<ssize_t>::max());
+        const ssize_t n       = pread(fd, out + done, to_read, (off_t) cur_offset);
+        if (n < 0 && errno == EINTR) {
+            continue;
+        }
+        if (n <= 0) {
+            return false;
+        }
+
+        done += (size_t) n;
+    }
+    return true;
+}
+
+static void ggml_rpp_weights_cache_staging_wait_locked(ggml_rpp_weights_cache_staging_buffer & buffer) {
+    if (buffer.copy_pending) {
+        RPP_CHECK(rtEventSynchronize(buffer.copy_done));
+        buffer.copy_pending = false;
+    }
+}
+
+static bool ggml_rpp_weights_cache_staging_resize_locked(ggml_rpp_weights_cache_staging_buffer & buffer, size_t size) {
+    if (buffer.ptr != nullptr && buffer.capacity >= size) {
+        return true;
+    }
+
+    if (buffer.ptr != nullptr) {
+        rtFreeHost(buffer.ptr);
+        buffer.ptr      = nullptr;
+        buffer.capacity = 0;
+    }
+
+    void * ptr = nullptr;
+    if (rtMallocHost(&ptr, size) != rtSuccess || ptr == nullptr) {
+        return false;
+    }
+
+    buffer.ptr      = ptr;
+    buffer.capacity = size;
+    return true;
+}
+
+static void * ggml_rpp_weights_cache_staging_acquire_locked(ggml_rpp_weights_cache_state & cache_state, size_t size) {
+    for (size_t i = 0; i < cache_state.staging_buffers.size(); ++i) {
+        const size_t idx = (cache_state.staging_next + i) % cache_state.staging_buffers.size();
+        ggml_rpp_weights_cache_staging_buffer & buffer = cache_state.staging_buffers[idx];
+        if (!buffer.in_use && !buffer.copy_pending && buffer.ptr != nullptr && buffer.capacity >= size) {
+            buffer.in_use         = true;
+            cache_state.staging_next = (idx + 1) % cache_state.staging_buffers.size();
+            return buffer.ptr;
+        }
+    }
+
+    for (size_t i = 0; i < cache_state.staging_buffers.size(); ++i) {
+        const size_t idx = (cache_state.staging_next + i) % cache_state.staging_buffers.size();
+        ggml_rpp_weights_cache_staging_buffer & buffer = cache_state.staging_buffers[idx];
+        if (!buffer.in_use && !buffer.copy_pending) {
+            if (!ggml_rpp_weights_cache_staging_resize_locked(buffer, size)) {
+                return nullptr;
+            }
+            buffer.in_use         = true;
+            cache_state.staging_next = (idx + 1) % cache_state.staging_buffers.size();
+            return buffer.ptr;
+        }
+    }
+
+    for (size_t i = 0; i < cache_state.staging_buffers.size(); ++i) {
+        const size_t idx = (cache_state.staging_next + i) % cache_state.staging_buffers.size();
+        ggml_rpp_weights_cache_staging_buffer & buffer = cache_state.staging_buffers[idx];
+        if (!buffer.in_use && buffer.copy_pending) {
+            ggml_rpp_weights_cache_staging_wait_locked(buffer);
+            if (!ggml_rpp_weights_cache_staging_resize_locked(buffer, size)) {
+                return nullptr;
+            }
+            buffer.in_use         = true;
+            cache_state.staging_next = (idx + 1) % cache_state.staging_buffers.size();
+            return buffer.ptr;
+        }
+    }
+
+    return nullptr;
+}
+
+static void ggml_rpp_weights_cache_staging_release_locked(ggml_rpp_weights_cache_state & cache_state, void * ptr) {
+    for (ggml_rpp_weights_cache_staging_buffer & buffer : cache_state.staging_buffers) {
+        if (buffer.ptr == ptr && buffer.in_use && !buffer.copy_pending) {
+            buffer.in_use = false;
+            return;
+        }
+    }
+}
+
+static bool ggml_rpp_weights_cache_staging_mark_copy_locked(ggml_rpp_weights_cache_state & cache_state, void * ptr) {
+    for (ggml_rpp_weights_cache_staging_buffer & buffer : cache_state.staging_buffers) {
+        if (buffer.ptr != ptr) {
+            continue;
+        }
+        if (buffer.copy_done == nullptr) {
+            RPP_CHECK(rtEventCreateWithFlags(&buffer.copy_done, rtEventDisableTiming));
+        }
+        RPP_CHECK(rtEventRecord(buffer.copy_done, rtStreamPerThread));
+        buffer.in_use       = false;
+        buffer.copy_pending = true;
+        return true;
+    }
+    return false;
+}
+
+static bool ggml_rpp_weights_cache_staging_mark_copy(void * ptr) {
+    if (ptr == nullptr) {
+        return false;
+    }
+
+    ggml_rpp_weights_cache_state & cache_state = ggml_rpp_weights_cache_get_state();
+    std::lock_guard<std::mutex>    lock(cache_state.mutex);
+    return ggml_rpp_weights_cache_staging_mark_copy_locked(cache_state, ptr);
+}
+
+static void * ggml_rpp_weights_cache_staging_acquire(size_t size) {
+    ggml_rpp_weights_cache_state & cache_state = ggml_rpp_weights_cache_get_state();
+    std::lock_guard<std::mutex>    lock(cache_state.mutex);
+    return ggml_rpp_weights_cache_staging_acquire_locked(cache_state, size);
+}
+
+static void ggml_rpp_weights_cache_staging_release(void * ptr) {
+    if (ptr == nullptr) {
+        return;
+    }
+
+    ggml_rpp_weights_cache_state & cache_state = ggml_rpp_weights_cache_get_state();
+    std::lock_guard<std::mutex>    lock(cache_state.mutex);
+    ggml_rpp_weights_cache_staging_release_locked(cache_state, ptr);
+}
+
+static void ggml_rpp_weights_cache_staging_free() {
+    ggml_rpp_weights_cache_state & cache_state = ggml_rpp_weights_cache_get_state();
+    std::lock_guard<std::mutex>    lock(cache_state.mutex);
+    for (ggml_rpp_weights_cache_staging_buffer & buffer : cache_state.staging_buffers) {
+        if (buffer.in_use) {
+            continue;
+        }
+        ggml_rpp_weights_cache_staging_wait_locked(buffer);
+        if (buffer.ptr != nullptr) {
+            rtFreeHost(buffer.ptr);
+            buffer.ptr      = nullptr;
+            buffer.capacity = 0;
+        }
+    }
+    if (cache_state.fd >= 0) {
+        close(cache_state.fd);
+        cache_state.fd = -1;
+    }
 }
 
 static uint64_t ggml_rpp_weights_cache_hash_bytes(const void * data, size_t size) {
@@ -915,6 +1133,9 @@ static std::string ggml_rpp_weights_cache_make_key(const ggml_tensor * tensor) {
     for (int i = 0; i < GGML_MAX_DIMS; ++i) {
         key += "|nb" + std::to_string(i) + "=" + std::to_string(tensor->nb[i]);
     }
+    if (is_conv_weight(tensor)) {
+        key += "|layout=conv_preformatted_bf16";
+    }
     return key;
 }
 
@@ -956,6 +1177,9 @@ static void ggml_rpp_weights_cache_init_locked(ggml_rpp_weights_cache_state & ca
         if (!ggml_rpp_weights_cache_create_empty_file(cache_state.file_path)) {
             return;
         }
+        if (!ggml_rpp_weights_cache_open_fd_locked(cache_state)) {
+            return;
+        }
         cache_state.enabled = true;
         GGML_LOG_INFO("%s: enabled RPP weight cache file: %s (new file)\n", __func__, cache_state.file_path.c_str());
         return;
@@ -970,6 +1194,9 @@ static void ggml_rpp_weights_cache_init_locked(ggml_rpp_weights_cache_state & ca
     if (!valid_header) {
         in.close();
         if (!ggml_rpp_weights_cache_create_empty_file(cache_state.file_path)) {
+            return;
+        }
+        if (!ggml_rpp_weights_cache_open_fd_locked(cache_state)) {
             return;
         }
         cache_state.enabled = true;
@@ -1021,9 +1248,59 @@ static void ggml_rpp_weights_cache_init_locked(ggml_rpp_weights_cache_state & ca
         };
     }
 
+    if (!ggml_rpp_weights_cache_open_fd_locked(cache_state)) {
+        return;
+    }
     cache_state.enabled = true;
     GGML_LOG_INFO("%s: enabled RPP weight cache file: %s, entries: %zu\n", __func__, cache_state.file_path.c_str(),
                   cache_state.index.size());
+}
+
+static int64_t ggml_rpp_matmul_weight_batch_count(const ggml_tensor * tensor) {
+    int64_t count = 1;
+    for (int i = 2; i < GGML_MAX_DIMS; ++i) {
+        count *= std::max<int64_t>(1, tensor->ne[i]);
+    }
+    return count;
+}
+
+static bool ggml_rpp_get_conv_weight_converted_size(const ggml_tensor * tensor,
+                                                    size_t              input_size,
+                                                    size_t *            converted_size) {
+    if (converted_size == nullptr || !is_conv_weight(tensor)) {
+        return false;
+    }
+
+    if (tensor->type != GGML_TYPE_F32 && tensor->type != GGML_TYPE_F16 && tensor->type != GGML_TYPE_BF16) {
+        return false;
+    }
+
+    const int kernel_w     = (int) tensor->ne[0];
+    const int kernel_h     = (int) tensor->ne[1];
+    const int in_channels  = (int) tensor->ne[2];
+    const int out_channels = (int) tensor->ne[3];
+    if (kernel_w <= 0 || kernel_h <= 0 || in_channels <= 0 || out_channels <= 0) {
+        return false;
+    }
+
+    const int64_t n_elements = ggml_nelements(tensor);
+    const size_t expected_input_size = (size_t) n_elements * ggml_type_size(tensor->type);
+    if (input_size != expected_input_size) {
+        return false;
+    }
+
+    *converted_size = rpp_conv_bf16_preformatted_weight_size(in_channels, out_channels, kernel_h, kernel_w);
+    return true;
+}
+
+static void ggml_rpp_preformat_conv_weight_to_bf16(const ggml_tensor * tensor, const void * data, void * out) {
+    const int kernel_w     = (int) tensor->ne[0];
+    const int kernel_h     = (int) tensor->ne[1];
+    const int in_channels  = (int) tensor->ne[2];
+    const int out_channels = (int) tensor->ne[3];
+
+    rpp_conv_bf16_preformat_weights(data, out, in_channels, out_channels, kernel_h, kernel_w,
+                                    (int) ggml_type_size(tensor->type));
 }
 
 static bool ggml_rpp_get_matmul_weight_converted_size(const ggml_tensor * tensor,
@@ -1033,45 +1310,45 @@ static bool ggml_rpp_get_matmul_weight_converted_size(const ggml_tensor * tensor
         return false;
     }
 
-    const int64_t n_experts = std::max<int64_t>(1, tensor->ne[2]);
+    const int64_t n_batches = ggml_rpp_matmul_weight_batch_count(tensor);
     const int64_t K         = tensor->ne[0];
     const int64_t N         = tensor->ne[1];
     const size_t  Kp        = (size_t) (((uint64_t) K + 31u) & ~31u);
     const size_t  Np        = (size_t) (((uint64_t) N + 31u) & ~31u);
-    if (K <= 0 || N <= 0 || n_experts <= 0) {
+    if (K <= 0 || N <= 0 || n_batches <= 0) {
         return false;
     }
-    const size_t n_experts_sz = (size_t) n_experts;
+    const size_t n_batches_sz = (size_t) n_batches;
 
     switch (tensor->type) {
         case GGML_TYPE_BF16:
             {
-                const size_t in_expert_sz  = (size_t) K * (size_t) N * sizeof(ggml_bf16_t);
-                const size_t out_expert_sz = Kp * Np * sizeof(uint16_t);
-                if (input_size != in_expert_sz * n_experts_sz) {
+                const size_t in_batch_sz  = (size_t) K * (size_t) N * sizeof(ggml_bf16_t);
+                const size_t out_batch_sz = Kp * Np * sizeof(uint16_t);
+                if (input_size != in_batch_sz * n_batches_sz) {
                     return false;
                 }
-                *converted_size = out_expert_sz * n_experts_sz;
+                *converted_size = out_batch_sz * n_batches_sz;
                 return true;
             }
         case GGML_TYPE_F16:
             {
-                const size_t in_expert_sz  = (size_t) K * (size_t) N * sizeof(ggml_fp16_t);
-                const size_t out_expert_sz = Kp * Np * sizeof(uint16_t);
-                if (input_size != in_expert_sz * n_experts_sz) {
+                const size_t in_batch_sz  = (size_t) K * (size_t) N * sizeof(ggml_fp16_t);
+                const size_t out_batch_sz = Kp * Np * sizeof(uint16_t);
+                if (input_size != in_batch_sz * n_batches_sz) {
                     return false;
                 }
-                *converted_size = out_expert_sz * n_experts_sz;
+                *converted_size = out_batch_sz * n_batches_sz;
                 return true;
             }
         case GGML_TYPE_F32:
             {
-                const size_t in_expert_sz  = (size_t) K * (size_t) N * sizeof(float);
-                const size_t out_expert_sz = Kp * Np * sizeof(uint16_t);
-                if (input_size != in_expert_sz * n_experts_sz) {
+                const size_t in_batch_sz  = (size_t) K * (size_t) N * sizeof(float);
+                const size_t out_batch_sz = Kp * Np * sizeof(uint16_t);
+                if (input_size != in_batch_sz * n_batches_sz) {
                     return false;
                 }
-                *converted_size = out_expert_sz * n_experts_sz;
+                *converted_size = out_batch_sz * n_batches_sz;
                 return true;
             }
         case GGML_TYPE_IQ3_XXS:
@@ -1080,89 +1357,89 @@ static bool ggml_rpp_get_matmul_weight_converted_size(const ggml_tensor * tensor
                 const size_t scales_sz    = (size_t) (K / 128) * (size_t) N * sizeof(uint16_t);
                 const size_t sign_sz      = (size_t) (K / 16) * (size_t) N * sizeof(uint16_t);
                 const size_t super_sz     = (size_t) (K / QK_K) * (size_t) N * sizeof(bfloat16_u16);
-                const size_t in_expert_sz = ggml_row_size(tensor->type, K) * (size_t) N;
-                if (input_size != in_expert_sz * n_experts_sz) {
+                const size_t in_batch_sz = ggml_row_size(tensor->type, K) * (size_t) N;
+                if (input_size != in_batch_sz * n_batches_sz) {
                     return false;
                 }
-                *converted_size = (codebook_sz + scales_sz + sign_sz + super_sz) * n_experts_sz;
+                *converted_size = (codebook_sz + scales_sz + sign_sz + super_sz) * n_batches_sz;
                 return true;
             }
         case GGML_TYPE_Q4_1:
             {
-                const size_t expert_sz = (size_t) (K / 4) * (size_t) N * sizeof(uint16_t) +
-                                         (size_t) (K / 32) * (size_t) N * sizeof(bfloat16_u16) +
-                                         (size_t) (K / 32) * (size_t) N * sizeof(bfloat16_u16);
-                if (input_size != expert_sz * n_experts_sz) {
+                const size_t batch_sz = (size_t) (K / 4) * (size_t) N * sizeof(uint16_t) +
+                                        (size_t) (K / 32) * (size_t) N * sizeof(bfloat16_u16) +
+                                        (size_t) (K / 32) * (size_t) N * sizeof(bfloat16_u16);
+                if (input_size != batch_sz * n_batches_sz) {
                     return false;
                 }
-                *converted_size = expert_sz * n_experts_sz;
+                *converted_size = batch_sz * n_batches_sz;
                 return true;
             }
         case GGML_TYPE_Q8_0:
             {
-                const size_t expert_sz = (size_t) (K / 2) * (size_t) N * sizeof(uint16_t) +
-                                         (size_t) (K / 32) * (size_t) N * sizeof(bfloat16_u16);
-                if (input_size != expert_sz * n_experts_sz) {
+                const size_t batch_sz = (size_t) (K / 2) * (size_t) N * sizeof(uint16_t) +
+                                        (size_t) (K / 32) * (size_t) N * sizeof(bfloat16_u16);
+                if (input_size != batch_sz * n_batches_sz) {
                     return false;
                 }
-                *converted_size = expert_sz * n_experts_sz;
+                *converted_size = batch_sz * n_batches_sz;
                 return true;
             }
         case GGML_TYPE_Q4_K:
             {
                 const int64_t ng = K / QK_K;
-                const size_t  expert_sz =
+                const size_t  batch_sz =
                     (size_t) (K / 4) * (size_t) N * sizeof(uint16_t) +
                     (size_t) (2 * ng) * (size_t) N * sizeof(uint16_t) +
                     (size_t) (2 * ng) * (size_t) N * sizeof(uint16_t) + (size_t) ng * (size_t) N * sizeof(uint16_t) +
                     (size_t) ng * (size_t) N * sizeof(uint16_t) + (size_t) ng * (size_t) N * sizeof(bfloat16_u16) +
                     (size_t) ng * (size_t) N * sizeof(bfloat16_u16);
-                if (input_size != expert_sz * n_experts_sz) {
+                if (input_size != batch_sz * n_batches_sz) {
                     return false;
                 }
-                *converted_size = expert_sz * n_experts_sz;
+                *converted_size = batch_sz * n_batches_sz;
                 return true;
             }
         case GGML_TYPE_Q5_K:
             {
                 const int64_t ng = K / QK_K;
-                const size_t  expert_sz =
+                const size_t  batch_sz =
                     (size_t) (K / 4) * (size_t) N * sizeof(uint16_t) +
                     (size_t) (K / 16) * (size_t) N * sizeof(uint16_t) +
                     (size_t) (2 * ng) * (size_t) N * sizeof(uint16_t) +
                     (size_t) (2 * ng) * (size_t) N * sizeof(uint16_t) + (size_t) ng * (size_t) N * sizeof(uint16_t) +
                     (size_t) ng * (size_t) N * sizeof(uint16_t) + (size_t) ng * (size_t) N * sizeof(bfloat16_u16) +
                     (size_t) ng * (size_t) N * sizeof(bfloat16_u16);
-                if (input_size != expert_sz * n_experts_sz) {
+                if (input_size != batch_sz * n_batches_sz) {
                     return false;
                 }
-                *converted_size = expert_sz * n_experts_sz;
+                *converted_size = batch_sz * n_batches_sz;
                 return true;
             }
         case GGML_TYPE_Q6_K:
             {
-                const size_t expert_sz = (size_t) (K / 4) * (size_t) N * sizeof(uint16_t) +
-                                         (size_t) (K / 8) * (size_t) N * sizeof(uint16_t) +
-                                         (size_t) (K / 32) * (size_t) N * sizeof(uint16_t) +
-                                         (size_t) (K / QK_K) * (size_t) N * sizeof(bfloat16_u16);
-                if (input_size != expert_sz * n_experts_sz) {
+                const size_t batch_sz = (size_t) (K / 4) * (size_t) N * sizeof(uint16_t) +
+                                        (size_t) (K / 8) * (size_t) N * sizeof(uint16_t) +
+                                        (size_t) (K / 32) * (size_t) N * sizeof(uint16_t) +
+                                        (size_t) (K / QK_K) * (size_t) N * sizeof(bfloat16_u16);
+                if (input_size != batch_sz * n_batches_sz) {
                     return false;
                 }
-                *converted_size = expert_sz * n_experts_sz;
+                *converted_size = batch_sz * n_batches_sz;
                 return true;
             }
         case GGML_TYPE_IQ2_S:
         case GGML_TYPE_IQ2_XS:
             {
-                const size_t in_expert_sz  = ggml_row_size(tensor->type, K) * (size_t) N;
-                const size_t out_expert_sz = (size_t) (K / 8) * (size_t) N * sizeof(uint16_t) +
-                                             (size_t) (K / 64) * (size_t) N * sizeof(uint16_t) +
-                                             (size_t) (K / 16) * (size_t) N * sizeof(uint16_t) +
-                                             (size_t) (K / QK_K) * (size_t) N * sizeof(bfloat16_u16);
-                if (input_size != in_expert_sz * n_experts_sz) {
+                const size_t in_batch_sz  = ggml_row_size(tensor->type, K) * (size_t) N;
+                const size_t out_batch_sz = (size_t) (K / 8) * (size_t) N * sizeof(uint16_t) +
+                                            (size_t) (K / 64) * (size_t) N * sizeof(uint16_t) +
+                                            (size_t) (K / 16) * (size_t) N * sizeof(uint16_t) +
+                                            (size_t) (K / QK_K) * (size_t) N * sizeof(bfloat16_u16);
+                if (input_size != in_batch_sz * n_batches_sz) {
                     return false;
                 }
-                *converted_size = out_expert_sz * n_experts_sz;
+                *converted_size = out_batch_sz * n_batches_sz;
                 return true;
             }
         default:
@@ -1201,26 +1478,14 @@ static bool ggml_rpp_weights_cache_try_load(const ggml_tensor * tensor,
         return false;
     }
 
-    void * cached_data = nullptr;
-    if (rtMallocHost(&cached_data, output_size) != rtSuccess || cached_data == nullptr) {
+    void * cached_data = ggml_rpp_weights_cache_staging_acquire_locked(cache_state, output_size);
+    if (cached_data == nullptr) {
         return false;
     }
 
-    std::ifstream in(cache_state.file_path, std::ios::binary);
-    if (!in.is_open()) {
-        rtFreeHost(cached_data);
-        return false;
-    }
-
-    in.seekg((std::streamoff) entry.payload_offset, std::ios::beg);
-    if (!in.good()) {
-        rtFreeHost(cached_data);
-        return false;
-    }
-
-    in.read((char *) cached_data, (std::streamsize) output_size);
-    if (!in.good()) {
-        rtFreeHost(cached_data);
+    if (!ggml_rpp_weights_cache_open_fd_locked(cache_state) ||
+        !ggml_rpp_weights_cache_pread_full(cache_state.fd, cached_data, output_size, entry.payload_offset)) {
+        ggml_rpp_weights_cache_staging_release_locked(cache_state, cached_data);
         return false;
     }
 
@@ -1361,180 +1626,161 @@ static void ggml_backend_rpp_buffer_set_tensor(ggml_backend_buffer_t buffer,
     ggml_rpp_set_device(ctx->device);
     void *        tmp              = nullptr;
     size_t        copy_size        = size;
-    const int64_t n_experts        = std::max<int64_t>(1, tensor->ne[2]);
+    const int64_t n_batches        = ggml_rpp_matmul_weight_batch_count(tensor);
     size_t        cached_copy_size = 0;
     const bool    cache_eligible =
-        offset == 0 && ggml_rpp_get_matmul_weight_converted_size(tensor, size, &cached_copy_size);
+        offset == 0 && (ggml_rpp_get_conv_weight_converted_size(tensor, size, &cached_copy_size) ||
+                        ggml_rpp_get_matmul_weight_converted_size(tensor, size, &cached_copy_size));
     bool cache_hit = false;
+    bool tmp_from_staging = false;
+
+    auto alloc_tmp = [&](size_t alloc_size) {
+        tmp = ggml_rpp_weights_cache_staging_acquire(alloc_size);
+        if (tmp != nullptr) {
+            tmp_from_staging = true;
+            return;
+        }
+        rtMallocHost(&tmp, alloc_size);
+    };
 
     if (cache_eligible) {
         cache_hit = ggml_rpp_weights_cache_try_load(tensor, data, size, cached_copy_size, &tmp);
         if (cache_hit) {
             copy_size = cached_copy_size;
+            tmp_from_staging = true;
         }
     }
 
-    if (!cache_hit && is_matmul_weight(tensor)) {
+    if (!cache_hit && is_conv_weight(tensor)) {
+        if (!ggml_rpp_get_conv_weight_converted_size(tensor, size, &copy_size)) {
+            GGML_LOG_ERROR("ggml_backend_rpp_buffer_set_tensor for conv: unsupported tensor type: %d\n",
+                           int(tensor->type));
+            GGML_ASSERT(false);
+            return;
+        }
+        alloc_tmp(copy_size);
+        ggml_rpp_preformat_conv_weight_to_bf16(tensor, data, tmp);
+    } else if (!cache_hit && is_matmul_weight(tensor)) {
+        GGML_ASSERT(ggml_rpp_get_matmul_weight_converted_size(tensor, size, &copy_size));
+        GGML_ASSERT(copy_size % (size_t) n_batches == 0);
+        const size_t converted_matmul_batch_size = copy_size / (size_t) n_batches;
         switch (tensor->type) {
             case GGML_TYPE_F32:
                 {
-                    const int    K             = tensor->ne[0];
-                    const int    N             = tensor->ne[1];
-                    const size_t Kp            = (size_t) (((uint64_t) K + 31u) & ~31u);
-                    const size_t Np            = (size_t) (((uint64_t) N + 31u) & ~31u);
-                    const size_t in_expert_sz  = (size_t) K * (size_t) N * sizeof(float);
-                    const size_t out_expert_sz = Kp * Np * sizeof(uint16_t);
-                    GGML_ASSERT(size == in_expert_sz * (size_t) n_experts);
-                    rtMallocHost(&tmp, out_expert_sz * (size_t) n_experts);
-                    for (int64_t ie = 0; ie < n_experts; ++ie) {
-                        const char * src_base = (const char *) data + (size_t) ie * in_expert_sz;
-                        char *       dst_base = (char *) tmp + (size_t) ie * out_expert_sz;
+                    const int    K            = tensor->ne[0];
+                    const int    N            = tensor->ne[1];
+                    const size_t in_batch_sz  = (size_t) K * (size_t) N * sizeof(float);
+                    const size_t out_batch_sz = converted_matmul_batch_size;
+                    GGML_ASSERT(size == in_batch_sz * (size_t) n_batches);
+                    alloc_tmp(out_batch_sz * (size_t) n_batches);
+                    for (int64_t ie = 0; ie < n_batches; ++ie) {
+                        const char * src_base = (const char *) data + (size_t) ie * in_batch_sz;
+                        char *       dst_base = (char *) tmp + (size_t) ie * out_batch_sz;
                         convert_fp32_to_rpp_bf16((const float *) src_base, K, N, dst_base);
                     }
-                    copy_size = out_expert_sz * (size_t) n_experts;
                     break;
                 }
             case GGML_TYPE_BF16:
                 {
-                    const int    K             = tensor->ne[0];
-                    const int    N             = tensor->ne[1];
-                    const size_t Kp            = (size_t) (((uint64_t) K + 31u) & ~31u);
-                    const size_t Np            = (size_t) (((uint64_t) N + 31u) & ~31u);
-                    const size_t in_expert_sz  = (size_t) K * (size_t) N * sizeof(ggml_bf16_t);
-                    const size_t out_expert_sz = Kp * Np * sizeof(uint16_t);
-                    GGML_ASSERT(size == in_expert_sz * (size_t) n_experts);
-                    rtMallocHost(&tmp, out_expert_sz * (size_t) n_experts);
-                    for (int64_t ie = 0; ie < n_experts; ++ie) {
-                        const char *        src_base = (const char *) data + (size_t) ie * in_expert_sz;
-                        char *              dst_base = (char *) tmp + (size_t) ie * out_expert_sz;
+                    const int    K            = tensor->ne[0];
+                    const int    N            = tensor->ne[1];
+                    const size_t in_batch_sz  = (size_t) K * (size_t) N * sizeof(ggml_bf16_t);
+                    const size_t out_batch_sz = converted_matmul_batch_size;
+                    GGML_ASSERT(size == in_batch_sz * (size_t) n_batches);
+                    alloc_tmp(out_batch_sz * (size_t) n_batches);
+                    for (int64_t ie = 0; ie < n_batches; ++ie) {
+                        const char *        src_base = (const char *) data + (size_t) ie * in_batch_sz;
+                        char *              dst_base = (char *) tmp + (size_t) ie * out_batch_sz;
                         const ggml_bf16_t * src_bf16 = (const ggml_bf16_t *) src_base;
                         convert_bf16_to_rpp_bf16(src_bf16, K, N, dst_base);
                     }
-                    copy_size = out_expert_sz * (size_t) n_experts;
                     break;
                 }
             case GGML_TYPE_F16:
                 {
-                    const int    K             = tensor->ne[0];
-                    const int    N             = tensor->ne[1];
-                    const size_t Kp            = (size_t) (((uint64_t) K + 31u) & ~31u);
-                    const size_t Np            = (size_t) (((uint64_t) N + 31u) & ~31u);
-                    const size_t in_expert_sz  = (size_t) K * (size_t) N * sizeof(ggml_fp16_t);
-                    const size_t out_expert_sz = Kp * Np * sizeof(uint16_t);
-                    GGML_ASSERT(size == in_expert_sz * (size_t) n_experts);
-                    rtMallocHost(&tmp, out_expert_sz * (size_t) n_experts);
-                    for (int64_t ie = 0; ie < n_experts; ++ie) {
-                        const char *        src_base = (const char *) data + (size_t) ie * in_expert_sz;
-                        char *              dst_base = (char *) tmp + (size_t) ie * out_expert_sz;
+                    const int    K            = tensor->ne[0];
+                    const int    N            = tensor->ne[1];
+                    const size_t in_batch_sz  = (size_t) K * (size_t) N * sizeof(ggml_fp16_t);
+                    const size_t out_batch_sz = converted_matmul_batch_size;
+                    GGML_ASSERT(size == in_batch_sz * (size_t) n_batches);
+                    alloc_tmp(out_batch_sz * (size_t) n_batches);
+                    for (int64_t ie = 0; ie < n_batches; ++ie) {
+                        const char *        src_base = (const char *) data + (size_t) ie * in_batch_sz;
+                        char *              dst_base = (char *) tmp + (size_t) ie * out_batch_sz;
                         const ggml_fp16_t * src_f16  = (const ggml_fp16_t *) src_base;
                         convert_f16_to_rpp_bf16(src_f16, K, N, dst_base);
                     }
-                    copy_size = out_expert_sz * (size_t) n_experts;
-
                     break;
                 }
             case GGML_TYPE_Q8_0:
                 {
-                    const int    K            = tensor->ne[0];
-                    const int    N            = tensor->ne[1];
-                    const size_t weights_size = (size_t) (K / 2) * (size_t) N * sizeof(uint16_t);
-                    const size_t scales_size  = (size_t) (K / 32) * (size_t) N * sizeof(bfloat16_u16);
-                    const size_t expert_sz    = weights_size + scales_size;
-                    GGML_ASSERT(size == expert_sz * (size_t) n_experts);
-                    rtMallocHost(&tmp, expert_sz * (size_t) n_experts);
-                    for (int64_t ie = 0; ie < n_experts; ++ie) {
-                        const char * src_base = (const char *) data + (size_t) ie * expert_sz;
-                        char *       dst_base = (char *) tmp + (size_t) ie * expert_sz;
+                    const int    K        = tensor->ne[0];
+                    const int    N        = tensor->ne[1];
+                    const size_t batch_sz = converted_matmul_batch_size;
+                    GGML_ASSERT(size == batch_sz * (size_t) n_batches);
+                    alloc_tmp(batch_sz * (size_t) n_batches);
+                    for (int64_t ie = 0; ie < n_batches; ++ie) {
+                        const char * src_base = (const char *) data + (size_t) ie * batch_sz;
+                        char *       dst_base = (char *) tmp + (size_t) ie * batch_sz;
                         convert_q8_0_to_rpp((block_q8_0_dbg *) src_base, K, N, dst_base);
                     }
-                    copy_size = expert_sz * (size_t) n_experts;
                     break;
                 }
             case GGML_TYPE_Q6_K:
                 {
-                    const int    K                 = tensor->ne[0];
-                    const int    N                 = tensor->ne[1];
-                    size_t       weights_ql_size   = K / 4 * N * sizeof(uint16_t);
-                    size_t       weights_qh_size   = K / 8 * N * sizeof(uint16_t);
-                    size_t       scales_size       = K / 32 * N * sizeof(uint16_t);
-                    size_t       super_scales_size = K / QK_K * N * sizeof(bfloat16_u16);
-                    const size_t expert_sz = weights_ql_size + weights_qh_size + scales_size + super_scales_size;
-                    GGML_ASSERT(size == expert_sz * (size_t) n_experts);
-                    rtMallocHost(&tmp, expert_sz * (size_t) n_experts);
-                    for (int64_t ie = 0; ie < n_experts; ++ie) {
-                        const char * src_base = (const char *) data + (size_t) ie * expert_sz;
-                        char *       dst_base = (char *) tmp + (size_t) ie * expert_sz;
+                    const int    K        = tensor->ne[0];
+                    const int    N        = tensor->ne[1];
+                    const size_t batch_sz = converted_matmul_batch_size;
+                    GGML_ASSERT(size == batch_sz * (size_t) n_batches);
+                    alloc_tmp(batch_sz * (size_t) n_batches);
+                    for (int64_t ie = 0; ie < n_batches; ++ie) {
+                        const char * src_base = (const char *) data + (size_t) ie * batch_sz;
+                        char *       dst_base = (char *) tmp + (size_t) ie * batch_sz;
                         convert_q6_k_to_rpp((block_q6_k_dbg *) src_base, K, N, dst_base);
                     }
-                    copy_size = expert_sz * (size_t) n_experts;
                     break;
                 }
             case GGML_TYPE_Q5_K:
                 {
-                    const int    K                = tensor->ne[0];
-                    const int    N                = tensor->ne[1];
-                    const int    ng               = K / QK_K;
-                    const size_t weights_lsb_size = (size_t) (K / 4) * (size_t) N * sizeof(uint16_t);
-                    const size_t weights_msb_size = (size_t) (K / 16) * (size_t) N * sizeof(uint16_t);
-                    const size_t scale_lsb_size   = (size_t) (2 * ng) * (size_t) N * sizeof(uint16_t);
-                    const size_t zero_lsb_size    = (size_t) (2 * ng) * (size_t) N * sizeof(uint16_t);
-                    const size_t scale_msb_size   = (size_t) ng * (size_t) N * sizeof(uint16_t);
-                    const size_t zero_msb_size    = (size_t) ng * (size_t) N * sizeof(uint16_t);
-                    const size_t super_scale_size = (size_t) ng * (size_t) N * sizeof(bfloat16_u16);
-                    const size_t super_zero_size  = (size_t) ng * (size_t) N * sizeof(bfloat16_u16);
-                    const size_t expert_sz = weights_lsb_size + weights_msb_size + scale_lsb_size + zero_lsb_size +
-                                             scale_msb_size + zero_msb_size + super_scale_size + super_zero_size;
-                    GGML_ASSERT(size == expert_sz * (size_t) n_experts);
-                    rtMallocHost(&tmp, expert_sz * (size_t) n_experts);
-                    for (int64_t ie = 0; ie < n_experts; ++ie) {
-                        const char * src_base = (const char *) data + (size_t) ie * expert_sz;
-                        char *       dst_base = (char *) tmp + (size_t) ie * expert_sz;
+                    const int    K        = tensor->ne[0];
+                    const int    N        = tensor->ne[1];
+                    const size_t batch_sz = converted_matmul_batch_size;
+                    GGML_ASSERT(size == batch_sz * (size_t) n_batches);
+                    alloc_tmp(batch_sz * (size_t) n_batches);
+                    for (int64_t ie = 0; ie < n_batches; ++ie) {
+                        const char * src_base = (const char *) data + (size_t) ie * batch_sz;
+                        char *       dst_base = (char *) tmp + (size_t) ie * batch_sz;
                         convert_q5_k_to_rpp((const block_q5_k_dbg *) src_base, K, N, dst_base);
                     }
-                    copy_size = expert_sz * (size_t) n_experts;
                     break;
                 }
 
             case GGML_TYPE_Q4_1:
                 {
-                    const int    K            = tensor->ne[0];
-                    const int    N            = tensor->ne[1];
-                    const size_t weights_size = (size_t) (K / 4) * (size_t) N * sizeof(uint16_t);
-                    const size_t scales_size  = (size_t) (K / 32) * (size_t) N * sizeof(bfloat16_u16);
-                    const size_t zeros_size   = (size_t) (K / 32) * (size_t) N * sizeof(bfloat16_u16);
-                    const size_t expert_sz    = weights_size + scales_size + zeros_size;
-                    GGML_ASSERT(size == expert_sz * (size_t) n_experts);
-                    rtMallocHost(&tmp, expert_sz * (size_t) n_experts);
-                    for (int64_t ie = 0; ie < n_experts; ++ie) {
-                        const char * src_base = (const char *) data + (size_t) ie * expert_sz;
-                        char *       dst_base = (char *) tmp + (size_t) ie * expert_sz;
+                    const int    K        = tensor->ne[0];
+                    const int    N        = tensor->ne[1];
+                    const size_t batch_sz = converted_matmul_batch_size;
+                    GGML_ASSERT(size == batch_sz * (size_t) n_batches);
+                    alloc_tmp(batch_sz * (size_t) n_batches);
+                    for (int64_t ie = 0; ie < n_batches; ++ie) {
+                        const char * src_base = (const char *) data + (size_t) ie * batch_sz;
+                        char *       dst_base = (char *) tmp + (size_t) ie * batch_sz;
                         convert_q4_1_to_rpp((block_q4_1_dbg *) src_base, K, N, dst_base);
                     }
-                    copy_size = expert_sz * (size_t) n_experts;
                     break;
                 }
             case GGML_TYPE_Q4_K:
                 {
-                    const int    K                = tensor->ne[0];
-                    const int    N                = tensor->ne[1];
-                    const int    ng               = K / QK_K;
-                    const size_t weights_size     = (size_t) (K / 4) * (size_t) N * sizeof(uint16_t);
-                    const size_t scale_lsb_size   = (size_t) (2 * ng) * (size_t) N * sizeof(uint16_t);
-                    const size_t zero_lsb_size    = (size_t) (2 * ng) * (size_t) N * sizeof(uint16_t);
-                    const size_t scale_msb_size   = (size_t) ng * (size_t) N * sizeof(uint16_t);
-                    const size_t zero_msb_size    = (size_t) ng * (size_t) N * sizeof(uint16_t);
-                    const size_t super_scale_size = (size_t) ng * (size_t) N * sizeof(bfloat16_u16);
-                    const size_t super_zero_size  = (size_t) ng * (size_t) N * sizeof(bfloat16_u16);
-                    const size_t expert_sz        = weights_size + scale_lsb_size + zero_lsb_size + scale_msb_size +
-                                             zero_msb_size + super_scale_size + super_zero_size;
-                    GGML_ASSERT(size == expert_sz * (size_t) n_experts);
-                    rtMallocHost(&tmp, expert_sz * (size_t) n_experts);
-                    for (int64_t ie = 0; ie < n_experts; ++ie) {
-                        const char * src_base = (const char *) data + (size_t) ie * expert_sz;
-                        char *       dst_base = (char *) tmp + (size_t) ie * expert_sz;
+                    const int    K        = tensor->ne[0];
+                    const int    N        = tensor->ne[1];
+                    const size_t batch_sz = converted_matmul_batch_size;
+                    GGML_ASSERT(size == batch_sz * (size_t) n_batches);
+                    alloc_tmp(batch_sz * (size_t) n_batches);
+                    for (int64_t ie = 0; ie < n_batches; ++ie) {
+                        const char * src_base = (const char *) data + (size_t) ie * batch_sz;
+                        char *       dst_base = (char *) tmp + (size_t) ie * batch_sz;
                         convert_q4_k_to_rpp((const block_q4_k_dbg *) src_base, K, N, dst_base);
                     }
-                    copy_size = expert_sz * (size_t) n_experts;
                     break;
                 }
             case GGML_TYPE_IQ3_XXS:
@@ -1545,31 +1791,25 @@ static void ggml_backend_rpp_buffer_set_tensor(ggml_backend_buffer_t buffer,
                     // const size_t scales_sz     = (size_t) (K / 128) * (size_t) N * sizeof(uint16_t);
                     // const size_t sign_sz       = (size_t) (K / 16) * (size_t) N * sizeof(uint16_t);
                     // const size_t super_sz      = (size_t) (K / QK_K) * (size_t) N * sizeof(bfloat16_u16);
-                    // const size_t in_expert_sz  = ggml_row_size(tensor->type, K) * (size_t) N;
-                    // const size_t out_expert_sz = codebook_sz + scales_sz + sign_sz + super_sz;
-                    // GGML_ASSERT(size == in_expert_sz * (size_t) n_experts);
-                    // rtMallocHost(&tmp, out_expert_sz * (size_t) n_experts);
-                    // for (int64_t ie = 0; ie < n_experts; ++ie) {
-                    //     const char * src_base = (const char *) data + (size_t) ie * in_expert_sz;
-                    //     char *       dst_base = (char *) tmp + (size_t) ie * out_expert_sz;
+                    // const size_t in_batch_sz  = ggml_row_size(tensor->type, K) * (size_t) N;
+                    // const size_t out_batch_sz = codebook_sz + scales_sz + sign_sz + super_sz;
+                    // GGML_ASSERT(size == in_batch_sz * (size_t) n_batches);
+                    // rtMallocHost(&tmp, out_batch_sz * (size_t) n_batches);
+                    // for (int64_t ie = 0; ie < n_batches; ++ie) {
+                    //     const char * src_base = (const char *) data + (size_t) ie * in_batch_sz;
+                    //     char *       dst_base = (char *) tmp + (size_t) ie * out_batch_sz;
                     //     convert_iq3_xxs_to_rpp((const block_iq3_xxs_dbg *) src_base, K, N, dst_base);
                     // }
-                    // copy_size = out_expert_sz * (size_t) n_experts;
 
-                    const size_t codebook_sz   = (size_t) (K / 16) * 3u * (size_t) N * sizeof(uint16_t);
-                    const size_t scales_sz     = (size_t) (K / 128) * (size_t) N * sizeof(uint16_t);
-                    const size_t sign_sz       = (size_t) (K / 16) * (size_t) N * sizeof(uint16_t);
-                    const size_t super_sz      = (size_t) (K / QK_K) * (size_t) N * sizeof(bfloat16_u16);
-                    const size_t in_expert_sz  = ggml_row_size(tensor->type, K) * (size_t) N;
-                    const size_t out_expert_sz = codebook_sz + scales_sz + sign_sz + super_sz;
-                    GGML_ASSERT(size == in_expert_sz * (size_t) n_experts);
-                    rtMallocHost(&tmp, out_expert_sz * (size_t) n_experts);
-                    for (int64_t ie = 0; ie < n_experts; ++ie) {
-                        const char * src_base = (const char *) data + (size_t) ie * in_expert_sz;
-                        char *       dst_base = (char *) tmp + (size_t) ie * out_expert_sz;
+                    const size_t in_batch_sz  = ggml_row_size(tensor->type, K) * (size_t) N;
+                    const size_t out_batch_sz = converted_matmul_batch_size;
+                    GGML_ASSERT(size == in_batch_sz * (size_t) n_batches);
+                    alloc_tmp(out_batch_sz * (size_t) n_batches);
+                    for (int64_t ie = 0; ie < n_batches; ++ie) {
+                        const char * src_base = (const char *) data + (size_t) ie * in_batch_sz;
+                        char *       dst_base = (char *) tmp + (size_t) ie * out_batch_sz;
                         convert_iq3_xxs_to_nolut((const block_iq3_xxs_dbg *) src_base, K, N, dst_base);
                     }
-                    copy_size = out_expert_sz * (size_t) n_experts;
                     break;
                 }
             case GGML_TYPE_IQ2_S:
@@ -1582,32 +1822,25 @@ static void ggml_backend_rpp_buffer_set_tensor(ggml_backend_buffer_t buffer,
                     // const size_t q2_scales_size       = (size_t) K / 64 * (size_t) N * sizeof(uint16_t);
                     // const size_t q2_sign_size         = (size_t) K / 16 * (size_t) N * sizeof(uint16_t);
                     // const size_t q2_super_scale_size  = (size_t) K / QK_K * (size_t) N * sizeof(bfloat16_u16);
-                    // const size_t q2_expert_size =
+                    // const size_t q2_batch_size =
                     //     q2_codebook_lsb_size + q2_codebook_msb_size + q2_scales_size + q2_sign_size + q2_super_scale_size;
-                    // GGML_ASSERT(size == q2_expert_size * (size_t) n_experts);
-                    // rtMallocHost(&tmp, q2_expert_size * (size_t) n_experts);
-                    // for (int64_t ie = 0; ie < n_experts; ++ie) {
-                    //     const char * src_base = (const char *) data + (size_t) ie * q2_expert_size;
-                    //     char *       dst_base = (char *) tmp + (size_t) ie * q2_expert_size;
+                    // GGML_ASSERT(size == q2_batch_size * (size_t) n_batches);
+                    // rtMallocHost(&tmp, q2_batch_size * (size_t) n_batches);
+                    // for (int64_t ie = 0; ie < n_batches; ++ie) {
+                    //     const char * src_base = (const char *) data + (size_t) ie * q2_batch_size;
+                    //     char *       dst_base = (char *) tmp + (size_t) ie * q2_batch_size;
                     //     convert_iq2_s_to_rpp((const block_iq2_s_dbg *) src_base, K, N, dst_base);
                     // }
-                    // copy_size = q2_expert_size * (size_t) n_experts;
 
-                    const size_t q2_codebook_nolut_size = (size_t) K / 8 * (size_t) N * sizeof(uint16_t);
-                    const size_t q2_scales_size         = (size_t) K / 64 * (size_t) N * sizeof(uint16_t);
-                    const size_t q2_sign_size           = (size_t) K / 16 * (size_t) N * sizeof(uint16_t);
-                    const size_t q2_super_scale_size    = (size_t) K / QK_K * (size_t) N * sizeof(bfloat16_u16);
-                    const size_t in_expert_sz           = ggml_row_size(tensor->type, K) * (size_t) N;
-                    const size_t out_expert_sz =
-                        q2_codebook_nolut_size + q2_scales_size + q2_sign_size + q2_super_scale_size;
-                    GGML_ASSERT(size == in_expert_sz * (size_t) n_experts);
-                    rtMallocHost(&tmp, out_expert_sz * (size_t) n_experts);
-                    for (int64_t ie = 0; ie < n_experts; ++ie) {
-                        const char * src_base = (const char *) data + (size_t) ie * in_expert_sz;
-                        char *       dst_base = (char *) tmp + (size_t) ie * out_expert_sz;
+                    const size_t in_batch_sz            = ggml_row_size(tensor->type, K) * (size_t) N;
+                    const size_t out_batch_sz           = converted_matmul_batch_size;
+                    GGML_ASSERT(size == in_batch_sz * (size_t) n_batches);
+                    alloc_tmp(out_batch_sz * (size_t) n_batches);
+                    for (int64_t ie = 0; ie < n_batches; ++ie) {
+                        const char * src_base = (const char *) data + (size_t) ie * in_batch_sz;
+                        char *       dst_base = (char *) tmp + (size_t) ie * out_batch_sz;
                         convert_iq2_s_to_nolut((const block_iq2_s_dbg *) src_base, K, N, dst_base);
                     }
-                    copy_size = out_expert_sz * (size_t) n_experts;
                     break;
                 }
             case GGML_TYPE_IQ2_XS:
@@ -1619,33 +1852,26 @@ static void ggml_backend_rpp_buffer_set_tensor(ggml_backend_buffer_t buffer,
                     // const size_t q2_qs_size          = (size_t) K / 8 * (size_t) N * sizeof(uint16_t);
                     // const size_t q2_scales_size      = (size_t) K / 64 * (size_t) N * sizeof(uint16_t);
                     // const size_t q2_super_scale_size = (size_t) ng * (size_t) N * sizeof(bfloat16_u16);
-                    // const size_t in_expert_sz        = ggml_row_size(tensor->type, K) * (size_t) N;
-                    // const size_t out_expert_sz       = q2_qs_size + q2_scales_size + q2_super_scale_size;
-                    // GGML_ASSERT(in_expert_sz == out_expert_sz);
-                    // GGML_ASSERT(size == in_expert_sz * (size_t) n_experts);
-                    // rtMallocHost(&tmp, out_expert_sz * (size_t) n_experts);
-                    // for (int64_t ie = 0; ie < n_experts; ++ie) {
-                    //     const char * src_base = (const char *) data + (size_t) ie * in_expert_sz;
-                    //     char *       dst_base = (char *) tmp + (size_t) ie * out_expert_sz;
+                    // const size_t in_batch_sz         = ggml_row_size(tensor->type, K) * (size_t) N;
+                    // const size_t out_batch_sz        = q2_qs_size + q2_scales_size + q2_super_scale_size;
+                    // GGML_ASSERT(in_batch_sz == out_batch_sz);
+                    // GGML_ASSERT(size == in_batch_sz * (size_t) n_batches);
+                    // rtMallocHost(&tmp, out_batch_sz * (size_t) n_batches);
+                    // for (int64_t ie = 0; ie < n_batches; ++ie) {
+                    //     const char * src_base = (const char *) data + (size_t) ie * in_batch_sz;
+                    //     char *       dst_base = (char *) tmp + (size_t) ie * out_batch_sz;
                     //     convert_iq2_xs_to_rpp((const block_iq2_xs_dbg *) src_base, K, N, dst_base);
                     // }
-                    // copy_size = out_expert_sz * (size_t) n_experts;
 
-                    const size_t q2_codebook_nolut_size = (size_t) K / 8 * (size_t) N * sizeof(uint16_t);
-                    const size_t q2_scales_size         = (size_t) K / 64 * (size_t) N * sizeof(uint16_t);
-                    const size_t q2_sign_size           = (size_t) K / 16 * (size_t) N * sizeof(uint16_t);
-                    const size_t q2_super_scale_size    = (size_t) K / QK_K * (size_t) N * sizeof(bfloat16_u16);
-                    const size_t in_expert_sz           = ggml_row_size(tensor->type, K) * (size_t) N;
-                    const size_t out_expert_sz =
-                        q2_codebook_nolut_size + q2_scales_size + q2_sign_size + q2_super_scale_size;
-                    GGML_ASSERT(size == in_expert_sz * (size_t) n_experts);
-                    rtMallocHost(&tmp, out_expert_sz * (size_t) n_experts);
-                    for (int64_t ie = 0; ie < n_experts; ++ie) {
-                        const char * src_base = (const char *) data + (size_t) ie * in_expert_sz;
-                        char *       dst_base = (char *) tmp + (size_t) ie * out_expert_sz;
+                    const size_t in_batch_sz            = ggml_row_size(tensor->type, K) * (size_t) N;
+                    const size_t out_batch_sz           = converted_matmul_batch_size;
+                    GGML_ASSERT(size == in_batch_sz * (size_t) n_batches);
+                    alloc_tmp(out_batch_sz * (size_t) n_batches);
+                    for (int64_t ie = 0; ie < n_batches; ++ie) {
+                        const char * src_base = (const char *) data + (size_t) ie * in_batch_sz;
+                        char *       dst_base = (char *) tmp + (size_t) ie * out_batch_sz;
                         convert_iq2_xs_to_nolut((const block_iq2_xs_dbg *) src_base, K, N, dst_base);
                     }
-                    copy_size = out_expert_sz * (size_t) n_experts;
                     break;
                 }
             default:
@@ -1658,12 +1884,23 @@ static void ggml_backend_rpp_buffer_set_tensor(ggml_backend_buffer_t buffer,
     const void * ddr_data = tmp == nullptr ? data : tmp;
     RPP_CHECK(
         rtMemcpyAsync((char *) tensor->data + offset, ddr_data, copy_size, rtMemcpyHostToDevice, rtStreamPerThread));
-    RPP_CHECK(rtStreamSynchronize(rtStreamPerThread));
-    if (!cache_hit && cache_eligible && tmp != nullptr && copy_size == cached_copy_size) {
-        ggml_rpp_weights_cache_store(tensor, data, size, tmp, copy_size);
-    }
-    if (tmp) {
-        rtFreeHost(tmp);
+
+    if (tmp_from_staging) {
+        if (!cache_hit && cache_eligible && tmp != nullptr && copy_size == cached_copy_size) {
+            ggml_rpp_weights_cache_store(tensor, data, size, tmp, copy_size);
+        }
+        if (!ggml_rpp_weights_cache_staging_mark_copy(tmp)) {
+            RPP_CHECK(rtStreamSynchronize(rtStreamPerThread));
+            ggml_rpp_weights_cache_staging_release(tmp);
+        }
+    } else {
+        RPP_CHECK(rtStreamSynchronize(rtStreamPerThread));
+        if (!cache_hit && cache_eligible && tmp != nullptr && copy_size == cached_copy_size) {
+            ggml_rpp_weights_cache_store(tensor, data, size, tmp, copy_size);
+        }
+        if (tmp) {
+            rtFreeHost(tmp);
+        }
     }
 }
 
@@ -1853,7 +2090,8 @@ static size_t ggml_backend_rpp_buffer_type_get_alloc_size(ggml_backend_buffer_ty
     int64_t ne0            = tensor->ne[0];
     size_t  converted_size = 0;
 
-    if (ggml_rpp_get_matmul_weight_converted_size(tensor, size, &converted_size)) {
+    if (ggml_rpp_get_conv_weight_converted_size(tensor, size, &converted_size) ||
+        ggml_rpp_get_matmul_weight_converted_size(tensor, size, &converted_size)) {
         // ggml backends are required to report an allocation size that is at
         // least the logical tensor byte size. Some RPP weight conversions
         // reduce storage (for example F32/F16/BF16 weights converted to BF16
@@ -2431,6 +2669,18 @@ static bool ggml_rpp_compute_forward(ggml_backend_rpp_context & ctx,
                                      struct ggml_tensor *       dst,
                                      int                        is_instantial = 1,
                                      int                        is_launch     = 1) {
+    ggml_rpp_trace_id_current = ctx.trace_id;
+#if GGML_RPP_PERF_TRACE
+#define GGML_RPP_TRACE_OP_CALL(call_expr)                             \
+    do {                                                              \
+        const std::string trace_name =                                \
+            std::string("ggml_rpp_compute_forward:") + ggml_op_name(dst->op); \
+        TRACE_SCOPE_GUARD(ctx.trace_id, trace_name.c_str());          \
+        call_expr;                                                    \
+    } while (0)
+#else
+#define GGML_RPP_TRACE_OP_CALL(call_expr) call_expr
+#endif
     // why is this here instead of mul_mat?
     // if (dst->src[0] != nullptr && ggml_backend_buft_is_rpp_split(dst->src[0]->buffer->buft)) {
     //     ggml_rpp_set_peer_access(dst->src[1]->ne[1], ctx.device);
@@ -2446,7 +2696,7 @@ static bool ggml_rpp_compute_forward(ggml_backend_rpp_context & ctx,
         case GGML_OP_REPEAT_BACK:
             break;
         case GGML_OP_GET_ROWS:
-            ggml_rpp_op_get_rows(ctx, dst, is_instantial, is_launch);
+            GGML_RPP_TRACE_OP_CALL(ggml_rpp_op_get_rows(ctx, dst, is_instantial, is_launch));
             // {
             //     char info[256];
             //     double time = measure_time_mics(ggml_rpp_op_get_rows, ctx, dst);
@@ -2458,18 +2708,18 @@ static bool ggml_rpp_compute_forward(ggml_backend_rpp_context & ctx,
         case GGML_OP_GET_ROWS_BACK:
             break;
         case GGML_OP_SET_ROWS:
-            ggml_rpp_op_set_rows(ctx, dst, is_instantial, is_launch);
+            GGML_RPP_TRACE_OP_CALL(ggml_rpp_op_set_rows(ctx, dst, is_instantial, is_launch));
             break;
         case GGML_OP_DUP:
             break;
         case GGML_OP_CPY:
-            ggml_rpp_op_cpy(ctx, dst, is_instantial, is_launch);
+            GGML_RPP_TRACE_OP_CALL(ggml_rpp_op_cpy(ctx, dst, is_instantial, is_launch));
             break;
         case GGML_OP_CONT:
-            ggml_rpp_op_cont(ctx, dst, is_instantial, is_launch);
+            GGML_RPP_TRACE_OP_CALL(ggml_rpp_op_cont(ctx, dst, is_instantial, is_launch));
             break;
         case GGML_OP_ADD:
-            ggml_rpp_op_add(ctx, dst, is_instantial, is_launch);
+            GGML_RPP_TRACE_OP_CALL(ggml_rpp_op_add(ctx, dst, is_instantial, is_launch));
             break;
         case GGML_OP_ADD1:  // TODO: more efficient implementation
             break;
@@ -2480,10 +2730,10 @@ static bool ggml_rpp_compute_forward(ggml_backend_rpp_context & ctx,
         case GGML_OP_ACC:
             break;
         case GGML_OP_MUL:
-            ggml_rpp_op_mul(ctx, dst, is_instantial, is_launch);
+            GGML_RPP_TRACE_OP_CALL(ggml_rpp_op_mul(ctx, dst, is_instantial, is_launch));
             break;
         case GGML_OP_DIV:
-            ggml_rpp_op_div(ctx, dst, is_instantial, is_launch);
+            GGML_RPP_TRACE_OP_CALL(ggml_rpp_op_div(ctx, dst, is_instantial, is_launch));
             break;
         case GGML_OP_UNARY:
             switch (ggml_get_unary_op(dst)) {
@@ -2492,8 +2742,6 @@ static bool ggml_rpp_compute_forward(ggml_backend_rpp_context & ctx,
                 case GGML_UNARY_OP_NEG:
                 case GGML_UNARY_OP_STEP:
                 case GGML_UNARY_OP_SILU:
-                case GGML_UNARY_OP_GELU_QUICK:
-                case GGML_UNARY_OP_TANH:
                 case GGML_UNARY_OP_RELU:
                 case GGML_UNARY_OP_SIGMOID:
                 case GGML_UNARY_OP_HARDSIGMOID:
@@ -2503,24 +2751,29 @@ static bool ggml_rpp_compute_forward(ggml_backend_rpp_context & ctx,
                     return false;
                 case GGML_UNARY_OP_GELU:
                 case GGML_UNARY_OP_GELU_ERF:
-                    ggml_rpp_op_unary(ctx, dst, is_instantial, is_launch);
+                case GGML_UNARY_OP_GELU_QUICK:
+                    GGML_RPP_TRACE_OP_CALL(ggml_rpp_op_unary(ctx, dst, is_instantial, is_launch));
+                    break;
+                case GGML_UNARY_OP_TANH:
+                    GGML_RPP_TRACE_OP_CALL(ggml_rpp_op_tanh(ctx, dst, is_instantial, is_launch));
                     break;
                 default:
                     return false;
             }
             break;
         case GGML_OP_GLU:
-            ggml_rpp_op_glu(ctx, dst, is_instantial, is_launch);
+            GGML_RPP_TRACE_OP_CALL(ggml_rpp_op_glu(ctx, dst, is_instantial, is_launch));
             break;
         case GGML_OP_NORM:
-            ggml_rpp_op_norm(ctx, dst, is_instantial, is_launch);
+            GGML_RPP_TRACE_OP_CALL(ggml_rpp_op_norm(ctx, dst, is_instantial, is_launch));
             break;
         case GGML_OP_GROUP_NORM:
             break;
         case GGML_OP_L2_NORM:
-            ggml_rpp_op_l2_norm(ctx, dst, is_instantial, is_launch);
+            GGML_RPP_TRACE_OP_CALL(ggml_rpp_op_l2_norm(ctx, dst, is_instantial, is_launch));
             break;
         case GGML_OP_CONCAT:
+            GGML_RPP_TRACE_OP_CALL(ggml_rpp_op_concat(ctx, dst, is_instantial, is_launch));
             break;
         case GGML_OP_UPSCALE:
             break;
@@ -2537,20 +2790,20 @@ static bool ggml_rpp_compute_forward(ggml_backend_rpp_context & ctx,
         case GGML_OP_SILU_BACK:
             break;
         case GGML_OP_RMS_NORM:
-            ggml_rpp_op_rms_norm(ctx, dst, is_instantial, is_launch);
+            GGML_RPP_TRACE_OP_CALL(ggml_rpp_op_rms_norm(ctx, dst, is_instantial, is_launch));
             break;
         case GGML_OP_RMS_NORM_BACK:
             break;
         case GGML_OP_MUL_MAT:
-            ggml_rpp_op_mul_mat(ctx, dst, is_instantial, is_launch);
+            GGML_RPP_TRACE_OP_CALL(ggml_rpp_op_mul_mat(ctx, dst, is_instantial, is_launch));
             break;
         case GGML_OP_MUL_MAT_ID:
-            ggml_rpp_op_mul_mat_id(ctx, dst, is_instantial, is_launch);
+            GGML_RPP_TRACE_OP_CALL(ggml_rpp_op_mul_mat_id(ctx, dst, is_instantial, is_launch));
             break;
         case GGML_OP_OUT_PROD:
             break;
         case GGML_OP_SCALE:
-            ggml_rpp_op_scale(ctx, dst, is_instantial, is_launch);
+            GGML_RPP_TRACE_OP_CALL(ggml_rpp_op_scale(ctx, dst, is_instantial, is_launch));
             break;
         case GGML_OP_SQR:
             break;
@@ -2561,6 +2814,7 @@ static bool ggml_rpp_compute_forward(ggml_backend_rpp_context & ctx,
         case GGML_OP_COS:
             break;
         case GGML_OP_CLAMP:
+            GGML_RPP_TRACE_OP_CALL(ggml_rpp_op_clamp(ctx, dst, is_instantial, is_launch));
             break;
         case GGML_OP_LOG:
             break;
@@ -2583,7 +2837,7 @@ static bool ggml_rpp_compute_forward(ggml_backend_rpp_context & ctx,
         case GGML_OP_SOFT_MAX_BACK:
             break;
         case GGML_OP_ROPE:
-            ggml_rpp_op_rope(ctx, dst, is_instantial, is_launch);
+            GGML_RPP_TRACE_OP_CALL(ggml_rpp_op_rope(ctx, dst, is_instantial, is_launch));
             break;
         case GGML_OP_ROPE_BACK:
             break;
@@ -2602,7 +2856,7 @@ static bool ggml_rpp_compute_forward(ggml_backend_rpp_context & ctx,
         case GGML_OP_CONV_TRANSPOSE_1D:
             break;
         case GGML_OP_POOL_2D:
-            ggml_rpp_op_pool_2d(ctx, dst, is_instantial, is_launch);
+            GGML_RPP_TRACE_OP_CALL(ggml_rpp_op_pool_2d(ctx, dst, is_instantial, is_launch));
             break;
         case GGML_OP_SUM:
             break;
@@ -2617,7 +2871,7 @@ static bool ggml_rpp_compute_forward(ggml_backend_rpp_context & ctx,
         case GGML_OP_ARGSORT:
             break;
         case GGML_OP_FLASH_ATTN_EXT:
-            ggml_rpp_op_flash_attn_ext(ctx, dst, is_instantial, is_launch);
+            GGML_RPP_TRACE_OP_CALL(ggml_rpp_op_flash_attn_ext(ctx, dst, is_instantial, is_launch));
             break;
         case GGML_OP_CROSS_ENTROPY_LOSS:
             break;
@@ -2636,6 +2890,7 @@ static bool ggml_rpp_compute_forward(ggml_backend_rpp_context & ctx,
         default:
             return false;
     }
+#undef GGML_RPP_TRACE_OP_CALL
 
     rtError_t err = rtGetLastError();
     if (err != rtSuccess) {
@@ -3059,8 +3314,24 @@ bool ggml_rpp_op_rms_norm_fused(ggml_backend_rpp_context & ctx,
     return ggml_rpp_op_rms_norm_mul_fusion(ctx, dst, mul_tensor, is_instantial, is_launch);
 }
 
+static bool ggml_rpp_is_rope_k_shift(const ggml_tensor * tensor) {
+    if (!tensor || tensor->op != GGML_OP_ROPE || !tensor->src[0] || !tensor->src[1]) {
+        return false;
+    }
+    if (tensor->src[1]->type != GGML_TYPE_I32 || tensor->src[1]->ne[0] != tensor->ne[2]) {
+        return false;
+    }
+
+    const ggml_tensor * src0_base = tensor->src[0]->view_src ? tensor->src[0]->view_src : tensor->src[0];
+    const std::string   name      = ggml_get_name(src0_base);
+    return name.find("cache_k") != std::string::npos;
+}
+
 static bool ggml_rpp_is_exclusive_graph_op(const ggml_tensor * node) {
     GGML_ASSERT(node && node->op != GGML_OP_NONE);
+    if (ggml_rpp_is_rope_k_shift(node)) {
+        return true;
+    }
     switch (node->op) {
         // case GGML_OP_GET_ROWS:
         // case GGML_OP_SET_ROWS:
@@ -3082,6 +3353,8 @@ static void evaluate_and_capture_rpp_graph(ggml_backend_rpp_context * rpp_ctx,
                                            bool &                     graph_evaluated_or_captured,
                                            bool &                     use_rpp_graph,
                                            bool &                     rpp_graph_update_required) {
+    ggml_rpp_trace_id_current = rpp_ctx->trace_id;
+    TRACE_SCOPE_GUARD(rpp_ctx->trace_id, "evaluate_and_capture_rpp_graph");
     // flag used to determine whether it is an integrated_gpu
     const bool integrated = ggml_rpp_info().devices[rpp_ctx->device].integrated;
     GGML_UNUSED(integrated);
@@ -3101,8 +3374,14 @@ static void evaluate_and_capture_rpp_graph(ggml_backend_rpp_context * rpp_ctx,
         if (rpp_graph_update_required) {
             TRACE_SCOPE_GUARD(rpp_ctx->trace_id, "rpp_context_update_graph_io");
             // to reset current graph
-            ggml_rpp_reset_graph(rpp_ctx, rpp_ctx->cur_rpp_graph);
-            rpp_ctx->cur_rpp_graph->nodes_all                         = get_ggml_graph_all_nodes(cgraph);
+            {
+                TRACE_SCOPE_GUARD(rpp_ctx->trace_id, "ggml_rpp_reset_graph");
+                ggml_rpp_reset_graph(rpp_ctx, rpp_ctx->cur_rpp_graph);
+            }
+            {
+                TRACE_SCOPE_GUARD(rpp_ctx->trace_id, "get_ggml_graph_all_nodes");
+                rpp_ctx->cur_rpp_graph->nodes_all = get_ggml_graph_all_nodes(cgraph);
+            }
             std::unordered_set<ggml_tensor *> & rppGgml_set           = rpp_ctx->cur_rpp_graph->nodes_all;
             std::unordered_set<ggml_tensor *> & rppGgml_o             = rpp_ctx->cur_rpp_graph->nodes_o;
             std::unordered_set<ggml_tensor *> & rppGgml_i             = rpp_ctx->cur_rpp_graph->nodes_i;
@@ -3111,31 +3390,34 @@ static void evaluate_and_capture_rpp_graph(ggml_backend_rpp_context * rpp_ctx,
             std::unordered_set<ggml_tensor *> & rppGgml_cache_kv      = rpp_ctx->cur_rpp_graph->nodes_cache_kv;
             rppGgml_o                                                 = rppGgml_set;
             // get cgraph inputs, outputs, weights etc, and create rpprt tensor
-            for (int i = 0; i < cgraph->n_nodes; i++) {
-                ggml_tensor * node = cgraph->nodes[i];
-                // if (ggml_is_empty(node) || node->op == GGML_OP_RESHAPE || node->op == GGML_OP_TRANSPOSE ||
-                //     node->op == GGML_OP_VIEW || node->op == GGML_OP_PERMUTE || node->op == GGML_OP_NONE) {
-                //     continue;
-                // }
-                for (size_t j = 0; j < GGML_MAX_SRC; j++) {
-                    auto src_node = node->src[j];
-                    if (src_node == nullptr) {
-                        break;
-                    }
-                    if (rppGgml_set.find(src_node) == rppGgml_set.end()) {
-                        if (is_matmul_weight(src_node)) {
-                            rppGgml_matmul_weight.emplace(src_node);
-                        } else if (is_mul_weight(src_node)) {
-                            rppGgml_mul_weight.emplace(src_node);
-                        } else if (is_cache_kv(src_node)) {
-                            rppGgml_cache_kv.emplace(src_node);
-                        } else {
-                            rppGgml_i.emplace(src_node);
+            {
+                TRACE_SCOPE_GUARD(rpp_ctx->trace_id, "classify_ggml_graph_nodes");
+                for (int i = 0; i < cgraph->n_nodes; i++) {
+                    ggml_tensor * node = cgraph->nodes[i];
+                    // if (ggml_is_empty(node) || node->op == GGML_OP_RESHAPE || node->op == GGML_OP_TRANSPOSE ||
+                    //     node->op == GGML_OP_VIEW || node->op == GGML_OP_PERMUTE || node->op == GGML_OP_NONE) {
+                    //     continue;
+                    // }
+                    for (size_t j = 0; j < GGML_MAX_SRC; j++) {
+                        auto src_node = node->src[j];
+                        if (src_node == nullptr) {
+                            break;
                         }
-                    } else {
-                        rppGgml_o.erase(src_node);
-                        if (node->op == GGML_OP_SET_ROWS && is_cache_kv(node)) {
-                            rppGgml_o.erase(node);
+                        if (rppGgml_set.find(src_node) == rppGgml_set.end()) {
+                            if (is_matmul_weight(src_node)) {
+                                rppGgml_matmul_weight.emplace(src_node);
+                            } else if (is_mul_weight(src_node)) {
+                                rppGgml_mul_weight.emplace(src_node);
+                            } else if (is_cache_kv(src_node)) {
+                                rppGgml_cache_kv.emplace(src_node);
+                            } else {
+                                rppGgml_i.emplace(src_node);
+                            }
+                        } else {
+                            rppGgml_o.erase(src_node);
+                            if (node->op == GGML_OP_SET_ROWS && is_cache_kv(node)) {
+                                rppGgml_o.erase(node);
+                            }
                         }
                     }
                 }
@@ -3143,110 +3425,131 @@ static void evaluate_and_capture_rpp_graph(ggml_backend_rpp_context * rpp_ctx,
 
             std::unordered_set<ggml_tensor *> expert_judgment_runtime_skips;
             // create rpp engines and compute forward
-            for (int i = 0; i < cgraph->n_nodes; i++) {
-                ggml_tensor * node = cgraph->nodes[i];
-                if (expert_judgment_runtime_skips.count(node)) {
-                    continue;
-                }
-                if (ggml_is_empty(node) || node->op == GGML_OP_RESHAPE || node->op == GGML_OP_TRANSPOSE ||
-                    node->op == GGML_OP_VIEW || node->op == GGML_OP_PERMUTE || node->op == GGML_OP_NONE) {
-                    continue;
-                }
-                int is_instantial = disable_graph_capture ? 1 : 0;
-                int is_launch     = disable_graph_capture ? 1 : 0;
-                if (!disable_graph_capture && ggml_rpp_is_exclusive_graph_op(node)) {
-                    is_instantial = 1;
-                    is_launch     = 0;
-                }
+            {
+                TRACE_SCOPE_GUARD(rpp_ctx->trace_id, "build_rpp_nodes");
+                for (int i = 0; i < cgraph->n_nodes; i++) {
+                    ggml_tensor * node = cgraph->nodes[i];
+                    if (expert_judgment_runtime_skips.count(node)) {
+                        continue;
+                    }
+                    if (ggml_is_empty(node) || node->op == GGML_OP_RESHAPE || node->op == GGML_OP_TRANSPOSE ||
+                        node->op == GGML_OP_VIEW || node->op == GGML_OP_PERMUTE || node->op == GGML_OP_NONE) {
+                        continue;
+                    }
+                    int is_instantial = disable_graph_capture ? 1 : 0;
+                    int is_launch     = disable_graph_capture ? 1 : 0;
+                    if (!disable_graph_capture && ggml_rpp_is_exclusive_graph_op(node)) {
+                        is_instantial = 1;
+                        is_launch     = 0;
+                    }
 
-                if (!disable_fusion) {
-                    if (node->op == GGML_OP_ADD) {
-                        int     n_fuse = 0;
-                        ggml_op ops[8];
-                        std::fill(ops, ops + 8, GGML_OP_ADD);
+                    if (!disable_fusion) {
+                        TRACE_SCOPE_GUARD(rpp_ctx->trace_id, "rpp_fusion_judgment");
+                        if (node->op == GGML_OP_ADD) {
+                            int     n_fuse = 0;
+                            ggml_op ops[8];
+                            std::fill(ops, ops + 8, GGML_OP_ADD);
 
-                        for (; n_fuse <= 6; ++n_fuse) {
-                            if (!ggml_can_fuse(cgraph, i + n_fuse, ops + n_fuse, 2)) {
-                                break;
+                            for (; n_fuse <= 6; ++n_fuse) {
+                                if (!ggml_can_fuse(cgraph, i + n_fuse, ops + n_fuse, 2)) {
+                                    break;
+                                }
+                                if (cgraph->nodes[i + n_fuse] != cgraph->nodes[i + n_fuse + 1]->src[0]) {
+                                    break;
+                                }
+                                if (!ggml_are_same_layout(cgraph->nodes[i + n_fuse]->src[1],
+                                                          cgraph->nodes[i + n_fuse + 1]->src[1])) {
+                                    break;
+                                }
                             }
-                            if (cgraph->nodes[i + n_fuse] != cgraph->nodes[i + n_fuse + 1]->src[0]) {
-                                break;
-                            }
-                            if (!ggml_are_same_layout(cgraph->nodes[i + n_fuse]->src[1],
-                                                      cgraph->nodes[i + n_fuse + 1]->src[1])) {
-                                break;
+                            n_fuse++;
+
+                            if (n_fuse > 1) {
+                                TRACE_SCOPE_GUARD(rpp_ctx->trace_id, "ggml_rpp_op_reduce_sum_fusion");
+                                for (int j = 0; j < n_fuse - 1; ++j) {
+                                    node->src[j + 2] = cgraph->nodes[i + j + 1]->src[1];
+                                }
+                                cgraph->nodes[i + n_fuse - 1]->data = node->data;
+                                const bool ok_fuse = ggml_rpp_op_reduce_sum(*rpp_ctx, node, is_instantial, is_launch);
+                                if (!ok_fuse) {
+                                    GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name,
+                                                   ggml_op_name(node->op));
+                                }
+                                GGML_ASSERT(ok_fuse);
+                                // because the reduce sum node is fused, so we need to set the node properties for the reduce sum node
+                                set_ggml_graph_node_properties(cgraph->nodes[i],
+                                                               &(rpp_ctx->cur_rpp_graph->ggml_graph_properties[i]));
+                                i += n_fuse - 1;
+                                continue;
                             }
                         }
-                        n_fuse++;
 
-                        if (n_fuse > 1) {
-                            for (int j = 0; j < n_fuse - 1; ++j) {
-                                node->src[j + 2] = cgraph->nodes[i + j + 1]->src[1];
+                        if (node->op == GGML_OP_RMS_NORM) {
+                            if (ggml_rpp_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL }, {})) {
+                                TRACE_SCOPE_GUARD(rpp_ctx->trace_id, "ggml_rpp_op_rms_norm_fused");
+                                const bool ok_fuse = ggml_rpp_op_rms_norm_fused(*rpp_ctx, node, cgraph->nodes[i + 1],
+                                                                                is_instantial, is_launch);
+                                if (!ok_fuse) {
+                                    GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name,
+                                                   ggml_op_name(node->op));
+                                }
+                                GGML_ASSERT(ok_fuse);
+                                i++;
+                                continue;
                             }
-                            cgraph->nodes[i + n_fuse - 1]->data = node->data;
-                            const bool ok_fuse = ggml_rpp_op_reduce_sum(*rpp_ctx, node, is_instantial, is_launch);
-                            if (!ok_fuse) {
-                                GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name,
-                                               ggml_op_name(node->op));
+                        }
+
+                        if (node->op == GGML_OP_SOFT_MAX) {
+                            ggml_rpp_router_expert_judgment_fusion_desc routing_fusion;
+                            if (ggml_rpp_can_fuse_expert_routing(cgraph, i, routing_fusion,
+                                                                 expert_judgment_runtime_skips)) {
+                                TRACE_SCOPE_GUARD(rpp_ctx->trace_id, "ggml_rpp_op_expert_routing_fusion");
+                                const bool ok_fuse =
+                                    ggml_rpp_op_expert_routing_fusion(*rpp_ctx, routing_fusion, is_instantial, is_launch);
+                                GGML_ASSERT(ok_fuse);
+                                expert_judgment_runtime_skips.insert(routing_fusion.compute_nodes_to_skip.begin(),
+                                                                     routing_fusion.compute_nodes_to_skip.end());
+                                continue;
                             }
-                            GGML_ASSERT(ok_fuse);
-                            // because the reduce sum node is fused, so we need to set the node properties for the reduce sum node
-                            set_ggml_graph_node_properties(cgraph->nodes[i],
-                                                           &(rpp_ctx->cur_rpp_graph->ggml_graph_properties[i]));
-                            i += n_fuse - 1;
-                            continue;
+                        }
+
+                        if (node->op == GGML_OP_MUL_MAT_ID) {
+                            ggml_tensor * gate_tensor = nullptr;
+                            ggml_tensor * up_tensor   = nullptr;
+                            ggml_tensor * down_tensor = nullptr;
+                            ggml_tensor * div_tensor  = nullptr;
+                            ggml_tensor * add_tensor  = nullptr;
+                            if (ggml_rpp_can_fuse_expert_forward(cgraph, i, gate_tensor, up_tensor, down_tensor,
+                                                                 div_tensor, add_tensor)) {
+                                TRACE_SCOPE_GUARD(rpp_ctx->trace_id, "ggml_rpp_op_export_forward");
+                                const bool ok_fuse =
+                                    ggml_rpp_op_export_forward(*rpp_ctx, gate_tensor, up_tensor, down_tensor, div_tensor,
+                                                               add_tensor, is_instantial, is_launch);
+                                GGML_ASSERT(ok_fuse);
+                                continue;
+                            }
+                        }
+
+                        if (node->op == GGML_OP_IM2COL) {
+                            ggml_tensor * input_tensor  = nullptr;
+                            ggml_tensor * weight_tensor = nullptr;
+                            ggml_tensor * output_tensor = nullptr;
+                            if (ggml_rpp_can_fuse_conv2d(cgraph, i, input_tensor, weight_tensor, output_tensor)) {
+                                TRACE_SCOPE_GUARD(rpp_ctx->trace_id, "ggml_rpp_op_kernel_fused_conv2d");
+                                const bool ok_fuse = ggml_rpp_op_kernel_fused_conv2d(
+                                    *rpp_ctx, input_tensor, weight_tensor, output_tensor, is_instantial, is_launch);
+                                GGML_ASSERT(ok_fuse);
+                                continue;
+                            }
                         }
                     }
 
-                    if (node->op == GGML_OP_RMS_NORM) {
-                        if (ggml_rpp_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL }, {})) {
-                            const bool ok_fuse = ggml_rpp_op_rms_norm_fused(*rpp_ctx, node, cgraph->nodes[i + 1],
-                                                                            is_instantial, is_launch);
-                            if (!ok_fuse) {
-                                GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name,
-                                               ggml_op_name(node->op));
-                            }
-                            GGML_ASSERT(ok_fuse);
-                            i++;
-                            continue;
-                        }
+                    const bool ok = ggml_rpp_compute_forward(*rpp_ctx, node, is_instantial, is_launch);
+                    if (!ok) {
+                        GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
                     }
-
-                    if (node->op == GGML_OP_SOFT_MAX) {
-                        ggml_rpp_router_expert_judgment_fusion_desc routing_fusion;
-                        if (ggml_rpp_can_fuse_expert_routing(cgraph, i, routing_fusion, expert_judgment_runtime_skips)) {
-                            TRACE_SCOPE_GUARD(rpp_ctx->trace_id, "ggml_rpp_op_expert_routing_fusion");
-                            const bool ok_fuse =
-                                ggml_rpp_op_expert_routing_fusion(*rpp_ctx, routing_fusion, is_instantial, is_launch);
-                            GGML_ASSERT(ok_fuse);
-                            expert_judgment_runtime_skips.insert(routing_fusion.compute_nodes_to_skip.begin(),
-                                                                 routing_fusion.compute_nodes_to_skip.end());
-                            continue;
-                        }
-                    }
-
-                    if (node->op == GGML_OP_MUL_MAT_ID) {
-                        ggml_tensor * gate_tensor = nullptr;
-                        ggml_tensor * up_tensor   = nullptr;
-                        ggml_tensor * down_tensor = nullptr;
-                        ggml_tensor * div_tensor  = nullptr;
-                        ggml_tensor * add_tensor  = nullptr;
-                        if (ggml_rpp_can_fuse_expert_forward(cgraph, i, gate_tensor, up_tensor, down_tensor, div_tensor,
-                                                             add_tensor)) {
-                            const bool ok_fuse =
-                                ggml_rpp_op_export_forward(*rpp_ctx, gate_tensor, up_tensor, down_tensor, div_tensor,
-                                                           add_tensor, is_instantial, is_launch);
-                            GGML_ASSERT(ok_fuse);
-                            continue;
-                        }
-                    }
+                    GGML_ASSERT(ok);
                 }
-
-                const bool ok = ggml_rpp_compute_forward(*rpp_ctx, node, is_instantial, is_launch);
-                if (!ok) {
-                    GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
-                }
-                GGML_ASSERT(ok);
             }
 
             if (!disable_graph_capture) {
@@ -3261,10 +3564,11 @@ static void evaluate_and_capture_rpp_graph(ggml_backend_rpp_context * rpp_ctx,
                 //     rpp_kernel_graphs.erase(graph_index);
                 // }
                 if (rpp_kernel_graphs.count(graph_index)) {
-                    TRACE_SCOPE_GUARD(rpp_ctx->trace_id, "rpp_update_child_graph");
+                    TRACE_SCOPE_GUARD(rpp_ctx->trace_id, "update_kernel_graphs");
                     auto & cur_kernel_graphs = rpp_kernel_graphs[graph_index];
                     auto & cur_rpp_nodes     = rpp_ctx->cur_rpp_graph->cur_rpp_nodes;
                     for (auto & cur_graph : cur_kernel_graphs) {
+                        TRACE_SCOPE_GUARD(rpp_ctx->trace_id, "rpp_update_child_graph");
                         cur_graph->update_child_graph(cur_rpp_nodes);
                         rpp_in_use_kernel_graphs.emplace_back(cur_graph.get());
                     }
@@ -3297,49 +3601,72 @@ static void evaluate_and_capture_rpp_graph(ggml_backend_rpp_context * rpp_ctx,
                         return true;
                     };
 
-                    for (auto & rpp_node : rpp_ctx->cur_rpp_graph->rpp_in_use_nodes) {
-                        auto &     ggml_node       = rpp_node->cur_ggml_tensor;
-                        const bool is_exclusive_op = ggml_rpp_is_exclusive_graph_op(ggml_node);
-                        if (is_exclusive_op) {
-                            append_exclusive_kernel_graph(ggml_node, pending_kernel_graph_idx);
-                        } else {
-                            append_shared_kernel_graph(ggml_node, pending_kernel_graph_idx);
+                    {
+                        TRACE_SCOPE_GUARD(rpp_ctx->trace_id, "create_kernel_graphs");
+                        for (auto & rpp_node : rpp_ctx->cur_rpp_graph->rpp_in_use_nodes) {
+                            auto &     ggml_node       = rpp_node->cur_ggml_tensor;
+                            const bool is_exclusive_op = ggml_rpp_is_exclusive_graph_op(ggml_node);
+                            if (is_exclusive_op) {
+                                append_exclusive_kernel_graph(ggml_node, pending_kernel_graph_idx);
+                            } else {
+                                append_shared_kernel_graph(ggml_node, pending_kernel_graph_idx);
+                            }
                         }
                     }
-                    for (auto & cur_graph : cur_kernel_graphs) {
-                        cur_graph->graph_instantiate();
-                        rpp_in_use_kernel_graphs.emplace_back(cur_graph.get());
+                    {
+                        TRACE_SCOPE_GUARD(rpp_ctx->trace_id, "instantiate_kernel_graphs");
+                        for (auto & cur_graph : cur_kernel_graphs) {
+                            cur_graph->graph_instantiate();
+                            rpp_in_use_kernel_graphs.emplace_back(cur_graph.get());
+                        }
                     }
                 }
-                const bool ok_launch_funcs = rpp_ctx->cur_rpp_graph->run_launch_funcs(*rpp_ctx);
+                bool ok_launch_funcs = false;
+                {
+                    TRACE_SCOPE_GUARD(rpp_ctx->trace_id, "run_launch_funcs");
+                    ok_launch_funcs = rpp_ctx->cur_rpp_graph->run_launch_funcs(*rpp_ctx);
+                }
                 if (!ok_launch_funcs) {
                     GGML_LOG_ERROR("%s: launch funcs failed before graph launch\n", __func__);
                 }
                 GGML_ASSERT(ok_launch_funcs);
-                for (auto & cur_graph : rpp_in_use_kernel_graphs) {
-                    cur_graph->graph_launch(*rpp_ctx, rpp_ctx->stream(), rpp_ctx->trace_id);
+                {
+                    TRACE_SCOPE_GUARD(rpp_ctx->trace_id, "launch_kernel_graphs");
+                    for (auto & cur_graph : rpp_in_use_kernel_graphs) {
+                        cur_graph->graph_launch(*rpp_ctx, rpp_ctx->stream(), rpp_ctx->trace_id);
+                    }
                 }
             }
         } else {
             if (!disable_graph_capture) {
-                auto &     kernel_graphs   = rpp_ctx->cur_rpp_graph->rpp_in_use_kernel_graphs;
-                const bool ok_launch_funcs = rpp_ctx->cur_rpp_graph->run_launch_funcs(*rpp_ctx);
+                auto & kernel_graphs = rpp_ctx->cur_rpp_graph->rpp_in_use_kernel_graphs;
+                bool   ok_launch_funcs = false;
+                {
+                    TRACE_SCOPE_GUARD(rpp_ctx->trace_id, "run_launch_funcs");
+                    ok_launch_funcs = rpp_ctx->cur_rpp_graph->run_launch_funcs(*rpp_ctx);
+                }
                 if (!ok_launch_funcs) {
                     GGML_LOG_ERROR("%s: launch funcs failed before graph launch\n", __func__);
                 }
                 GGML_ASSERT(ok_launch_funcs);
-                for (auto & cur_graph : kernel_graphs) {
-                    cur_graph->graph_launch(*rpp_ctx, rpp_ctx->stream(), rpp_ctx->trace_id);
+                {
+                    TRACE_SCOPE_GUARD(rpp_ctx->trace_id, "launch_kernel_graphs");
+                    for (auto & cur_graph : kernel_graphs) {
+                        cur_graph->graph_launch(*rpp_ctx, rpp_ctx->stream(), rpp_ctx->trace_id);
+                    }
                 }
             } else {
                 auto & rpp_nodes = rpp_ctx->cur_rpp_graph->rpp_in_use_nodes;
-                for (auto & rpp_node : rpp_nodes) {
-                    const bool ok = rpp_node->rpp_dispatch_func(*rpp_ctx, rpp_node->cur_ggml_tensor, 1, 1);
-                    if (!ok) {
-                        GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, rpp_node->cur_ggml_tensor->name,
-                                       ggml_op_name(rpp_node->cur_ggml_tensor->op));
+                {
+                    TRACE_SCOPE_GUARD(rpp_ctx->trace_id, "dispatch_rpp_nodes");
+                    for (auto & rpp_node : rpp_nodes) {
+                        const bool ok = rpp_node->rpp_dispatch_func(*rpp_ctx, rpp_node->cur_ggml_tensor, 1, 1);
+                        if (!ok) {
+                            GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, rpp_node->cur_ggml_tensor->name,
+                                           ggml_op_name(rpp_node->cur_ggml_tensor->op));
+                        }
+                        GGML_ASSERT(ok);
                     }
-                    GGML_ASSERT(ok);
                 }
             }
         }
@@ -3349,7 +3676,10 @@ static void evaluate_and_capture_rpp_graph(ggml_backend_rpp_context * rpp_ctx,
                 if (stream_ptr == nullptr) {
                     break;
                 }
-                RPP_CHECK(rtStreamSynchronize(stream_ptr));
+                {
+                    TRACE_SCOPE_GUARD(rpp_ctx->trace_id, "rtStreamSynchronize");
+                    RPP_CHECK(rtStreamSynchronize(stream_ptr));
+                }
             }
         }
         graph_evaluated_or_captured = true;
@@ -3371,6 +3701,10 @@ static void evaluate_and_capture_rpp_graph(ggml_backend_rpp_context * rpp_ctx,
 
 static enum ggml_status ggml_backend_rpp_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     ggml_backend_rpp_context * rpp_ctx = (ggml_backend_rpp_context *) backend->context;
+    ggml_rpp_weights_cache_staging_free();
+    // RPP graph capture/update mutates backend-wide graph state. Serialize it so
+    // concurrent server slots do not replace child graph execs from different requests.
+    // std::lock_guard<std::mutex> lock(ggml_rpp_lock);
     ggml_rpp_set_device(rpp_ctx->device);
     rpp_ctx->cur_rpp_graph = nullptr;
 #if GGML_RPP_DUMP_OPS
@@ -3397,13 +3731,13 @@ static enum ggml_status ggml_backend_rpp_graph_compute(ggml_backend_t backend, g
     }
     update_ggml_rpp_infer_states(rpp_ctx, rpp_ctx->cur_rpp_graph);
 #if GGML_RPP_PERF_TRACE
-    if (rpp_ctx->trace_num >= 2) {
+    if (rpp_ctx->trace_num >= 0) {   //only infer is 2, initial is 0
         rpp_ctx->trace_num++;
     }
-    if (rpp_ctx->trace_num == 3) {
+    if (rpp_ctx->trace_num == 1) { //only infer is 3, initial is 1
         TRACE_ENABLE(rpp_ctx->trace_id);
     }
-    if (rpp_ctx->trace_num > 7) {
+    if (rpp_ctx->trace_num > 3) { //only infer is 7， initial is 3
         TRACE_DISABLE(rpp_ctx->trace_id);
         exit(0);
     }
@@ -3702,6 +4036,8 @@ static bool ggml_backend_rpp_device_supports_op(ggml_backend_dev_t dev, const gg
                 switch (ggml_get_glu_op(op)) {
                     case GGML_GLU_OP_SWIGLU:
                     case GGML_GLU_OP_GEGLU_ERF:
+                    case GGML_GLU_OP_GEGLU:
+                    case GGML_GLU_OP_GEGLU_QUICK:
                         supported = true;
                         break;
                     default:
@@ -3713,8 +4049,15 @@ static bool ggml_backend_rpp_device_supports_op(ggml_backend_dev_t dev, const gg
         case GGML_OP_UNARY:
             {
                 switch (ggml_get_unary_op(op)) {
+                    case GGML_UNARY_OP_TANH:
+                        supported = op->src[0] != nullptr &&
+                                    (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_BF16) &&
+                                    (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_BF16) &&
+                                    ggml_is_contiguous_1(op->src[0]) && ggml_is_contiguous_1(op);
+                        break;
                     case GGML_UNARY_OP_GELU:
                     case GGML_UNARY_OP_GELU_ERF:
+                    case GGML_UNARY_OP_GELU_QUICK:
                         supported = true;
                         break;
                     default:
@@ -3724,9 +4067,18 @@ static bool ggml_backend_rpp_device_supports_op(ggml_backend_dev_t dev, const gg
             }
             break;
         case GGML_OP_ROPE:
-            supported = op->src[0]->nb[0] == ggml_type_size(op->src[0]->type) && ggml_is_contiguous_2(op->src[0]) &&
-                        op->src[0]->type == GGML_TYPE_F32;
-            // supported = false;
+            {
+                auto supports_rope_type = [](ggml_type type) {
+                    return type == GGML_TYPE_F32 || type == GGML_TYPE_F16 || type == GGML_TYPE_BF16;
+                };
+                const ggml_tensor * src0 = op->src[0];
+                supported                = src0 && supports_rope_type(src0->type) && supports_rope_type(op->type) &&
+                            src0->nb[0] == ggml_type_size(src0->type) &&
+                            src0->nb[1] >= src0->ne[0] * src0->nb[0] &&
+                            src0->nb[2] >= src0->ne[1] * src0->nb[1] &&
+                            op->nb[0] == ggml_type_size(op->type) && op->nb[1] >= op->ne[0] * op->nb[0] &&
+                            op->nb[2] >= op->ne[1] * op->nb[1];
+            }
             break;
         case GGML_OP_CONT:
             supported = true;
@@ -3744,7 +4096,18 @@ static bool ggml_backend_rpp_device_supports_op(ggml_backend_dev_t dev, const gg
             supported = op->src[0]->type == GGML_TYPE_F32;
             break;
         case GGML_OP_CLAMP:
-            supported = op->src[0]->type == GGML_TYPE_F32;
+            supported =
+                op->src[0] != nullptr &&
+                (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_BF16) &&
+                (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_BF16) &&
+                op->src[0]->type == op->type &&
+                ggml_is_contiguous_1(op->src[0]) && ggml_is_contiguous_1(op);
+            break;
+        case GGML_OP_CONCAT:
+            supported = ggml_rpp_concat_supports_op(op);
+            break;
+        case GGML_OP_IM2COL:
+            supported = op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_BF16;
             break;
         default:
             supported = false;
@@ -3753,7 +4116,7 @@ static bool ggml_backend_rpp_device_supports_op(ggml_backend_dev_t dev, const gg
     if (!supported){
         // GGML_LOG_WARN("ggml_backend_rpp_device_supports_op: unsupported op: %s\n", ggml_op_name(op->op));
     }
-    
+
     return supported;
 }
 
@@ -3779,6 +4142,11 @@ static bool ggml_backend_rpp_device_supports_buft(ggml_backend_dev_t dev, ggml_b
 
 static int64_t get_op_batch_size(const ggml_tensor * op) {
     switch (op->op) {
+        case GGML_OP_UNARY:
+            if (ggml_get_unary_op(op) == GGML_UNARY_OP_TANH) {
+                return ggml_nelements(op);
+            }
+            return ggml_nrows(op);
         case GGML_OP_GET_ROWS:
             return 0;
         case GGML_OP_MUL_MAT:
@@ -3944,16 +4312,20 @@ static ggml_backend_feature * ggml_backend_rpp_get_features(ggml_backend_reg_t r
         features.push_back({ "USE_ASYNC", "1" });
 #endif
 
-#ifdef GGML_RPP_SAVE_ENGINE
-        features.push_back({ "SAVE_ENGINE", STRINGIFY(GGML_RPP_SAVE_ENGINE) });
-#else
-        features.push_back({ "SAVE_ENGINE", "" });
-#endif
+#ifdef GGML_RPP_USE_RT
 
-#ifdef GGML_RPP_LOAD_ENGINE
+#    ifdef GGML_RPP_SAVE_ENGINE
+        features.push_back({ "SAVE_ENGINE", STRINGIFY(GGML_RPP_SAVE_ENGINE) });
+#    else
+        features.push_back({ "SAVE_ENGINE", "" });
+#    endif
+
+#    ifdef GGML_RPP_LOAD_ENGINE
         features.push_back({ "LOAD_ENGINE", STRINGIFY(GGML_RPP_LOAD_ENGINE) });
-#else
+#    else
         features.push_back({ "LOAD_ENGINE", "" });
+#    endif
+
 #endif
 
 #undef _STRINGIFY
@@ -3967,7 +4339,10 @@ static ggml_backend_feature * ggml_backend_rpp_get_features(ggml_backend_reg_t r
     GGML_UNUSED(reg);
 }
 
-static void ggml_backend_rpp_set_params(ggml_backend_t backend, const int domain, const int u_batch, const int max_context) {
+static void ggml_backend_rpp_set_params(ggml_backend_t backend,
+                                        const int      domain,
+                                        const int      u_batch,
+                                        const int      max_context) {
     if (!backend || !ggml_backend_is_rpp(backend)) {
         return;
     }

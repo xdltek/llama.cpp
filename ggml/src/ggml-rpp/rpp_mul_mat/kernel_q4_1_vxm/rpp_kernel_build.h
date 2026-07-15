@@ -12,9 +12,43 @@
 #include <cstdint>
 #include <cstring>
 #include <iostream>
+#include <mutex>
+#include <stdexcept>
 #include <vector>
 
 namespace kernel_q4_1_vxm {
+static RPPdeviceptr q4_1_vxm_prepare_lut_workspace(rpp_kernel_context & ctx, int lut_elements) {
+    static std::mutex   mutex;
+    static RPPdeviceptr kernel_lut_workspace       = 0;
+    static int          kernel_lut_workspace_bytes = 0;
+
+    const int lut_bytes = lut_elements * (int) sizeof(uint16_t);
+    std::lock_guard<std::mutex> lock(mutex);
+    if (kernel_lut_workspace == 0) {
+        if (rtMalloc((void **) &kernel_lut_workspace, lut_bytes) != rtSuccess) {
+            throw std::runtime_error("Q4_1 VXM rtMalloc failed for shared LUT workspace");
+        }
+        kernel_lut_workspace_bytes = lut_bytes;
+
+        std::vector<rpp::bfloat16> quant_table(lut_elements);
+        for (int i = 0; i < lut_elements; ++i) {
+            quant_table[i] = (rpp::bfloat16) i;
+        }
+        rtMemcpy((void *) kernel_lut_workspace, (const void *) quant_table.data(), lut_bytes, rtMemcpyHostToDevice);
+    } else if (kernel_lut_workspace_bytes != lut_bytes) {
+        throw std::runtime_error("Q4_1 VXM shared LUT workspace size mismatch");
+    }
+
+    RPPdeviceptr dev_lut_workspace = ctx.dev_workspace;
+    if (dev_lut_workspace == 0) {
+        dev_lut_workspace = kernel_lut_workspace;
+        ctx.dev_workspace = dev_lut_workspace;
+    } else if (dev_lut_workspace != kernel_lut_workspace) {
+        rtMemcpy((void *) dev_lut_workspace, (const void *) kernel_lut_workspace, lut_bytes, rtMemcpyDeviceToDevice);
+    }
+    return dev_lut_workspace;
+}
+
 inline void get_tiles_info(int N, int K, int weights_group, int & nr_of_tiles, int & groups_per_tile) {
     if (weights_group == 32) {
         if (K % 512 == 0) {
@@ -72,19 +106,13 @@ static void rpp_matmul_q4_1_vxm(rpp_kernel_context & ctx,
     RPPdeviceptr          devB_zero  = ctx.dev_in[3];
     RPPdeviceptr          devC       = ctx.dev_out[0];
 
-    // build exp table
-    int             lut_elements = 16;
-    rpp::bfloat16 * quant_table  = (rpp::bfloat16 *) malloc(lut_elements * sizeof(uint16_t));
-    for (uint32_t i = 0; i < lut_elements; i++) {
-        quant_table[i] = (rpp::bfloat16) i;
-    }
-    RPPdeviceptr dev_lut = ctx.dev_workspace;
-    rtMemcpy((void *) dev_lut, (const void *) quant_table, lut_elements * sizeof(short), rtMemcpyHostToDevice);
+    const int    lut_elements = 16;
+    RPPdeviceptr dev_lut      = q4_1_vxm_prepare_lut_workspace(ctx, lut_elements);
 
     // Capture on kernelStream (like CUDA graph capture pattern)
     rppStreamBeginCapture(ctx.kernelStream, RPP_STREAM_CAPTURE_MODE_GLOBAL);
     RPPmodule cuMod;
-    rppModuleLoad(&ctx.rppBinMod, "rpp_kernel/matmul_q4_vxm.o");
+    rpp_module_load_once(ctx.rppBinMod, "rpp_kernel/matmul_q4_vxm.o");
     // -------------------------
     // SRAM allocation planning
     // -------------------------
@@ -214,11 +242,10 @@ static void rpp_matmul_q4_1_vxm(rpp_kernel_context & ctx,
 
     // End capture after all enqueued work is defined
     rppStreamEndCapture(ctx.kernelStream, &ctx.graph);
-    if (is_instantial) {
-        rppGraphInstantiate(&ctx.graphexec, ctx.graph, NULL, NULL, 0);
+    const std::string graph_key = rpp_join_function_name_and_args(__func__, M, K, N, weights_group, in_bytes_per_element, out_bytes_per_element);
+    if (rpp_graph_instantiate(ctx.graphexec, ctx.graph, graph_key.c_str(), is_instantial) != RPP_SUCCESS) {
+        throw std::runtime_error("rpp_graph_instantiate failed.");
     }
-
-    free(quant_table);
 }
 
 static void rpp_matmul_q4_1_vxm_pipeline(rpp_kernel_context & ctx,
@@ -246,17 +273,11 @@ static void rpp_matmul_q4_1_vxm_pipeline(rpp_kernel_context & ctx,
     // -------------------------
     // LUT build
     // -------------------------
-    const int       lut_elements = 16;
-    rpp::bfloat16 * quant_table  = (rpp::bfloat16 *) malloc(lut_elements * sizeof(uint16_t));
-    for (int i = 0; i < lut_elements; ++i) {
-        quant_table[i] = (rpp::bfloat16) i;
-    }
-
-    RPPdeviceptr dev_lut = ctx.dev_workspace;
-    rtMemcpy((void *) dev_lut, (const void *) quant_table, lut_elements * sizeof(short), rtMemcpyHostToDevice);
+    const int    lut_elements = 16;
+    RPPdeviceptr dev_lut      = q4_1_vxm_prepare_lut_workspace(ctx, lut_elements);
 
     // Load module
-    rppModuleLoad(&ctx.rppBinMod, "rpp_kernel/matmul_q4_vxm.o");
+    rpp_module_load_once(ctx.rppBinMod, "rpp_kernel/matmul_q4_vxm.o");
 
     // -------------------------
     // SRAM allocation planning
@@ -477,11 +498,10 @@ static void rpp_matmul_q4_1_vxm_pipeline(rpp_kernel_context & ctx,
 #endif
     // end capture / instantiate graph
     rppStreamEndCapture(ctx.kernelStream, &ctx.graph);
-    if (is_instantial) {
-        rppGraphInstantiate(&ctx.graphexec, ctx.graph, NULL, NULL, 0);
+    const std::string graph_key = rpp_join_function_name_and_args(__func__, M, K, N, weights_group, in_bytes_per_element, out_bytes_per_element);
+    if (rpp_graph_instantiate(ctx.graphexec, ctx.graph, graph_key.c_str(), is_instantial) != RPP_SUCCESS) {
+        throw std::runtime_error("rpp_graph_instantiate failed.");
     }
-
-    free(quant_table);
 }
 
 static void rpp_matmul_q4_1_vxm_build(rpp_kernel_context & ctx,

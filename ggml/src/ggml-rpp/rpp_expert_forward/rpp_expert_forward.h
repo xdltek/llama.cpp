@@ -138,7 +138,6 @@ struct rpp_kernel_export_forward : public rpp_node_kernel {
     size_t       expert_counts_size  = 0;
     size_t       expert_offsets_size = 0;
     size_t       topk_slots_size     = 0;
-    size_t       workspace_size      = (64 * 1024) * (int) sizeof(uint16_t);
 
     kernel_expert_forward::fusion_runtime_plan plan;
     kernel_expert_forward::fusion_runtime_plan plan_next;

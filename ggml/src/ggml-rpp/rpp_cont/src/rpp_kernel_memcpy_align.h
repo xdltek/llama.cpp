@@ -36,7 +36,8 @@ static inline void rpp_cont_memcpy_align_build(rpp_kernel_context & ctx,
     }
 
     rppStreamEndCapture(ctx.kernelStream, &ctx.graph);
-    if (is_instantial) {
-        rppGraphInstantiate(&ctx.graphexec, ctx.graph, NULL, NULL, 0);
-    }
+    const std::string graph_key =
+        rpp_join_function_name_and_args(__func__, oD0, oD1, oD2, in_stride_x, in_stride_y, in_stride_z,
+                                        input_span_bytes, bytes_per_element);
+    RPP_CHECK(rpp_graph_instantiate(ctx.graphexec, ctx.graph, graph_key.c_str(), is_instantial));
 }

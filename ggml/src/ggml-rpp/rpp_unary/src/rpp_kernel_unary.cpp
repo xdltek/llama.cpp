@@ -6,29 +6,11 @@ static int ggml_rpp_unary_seq_len(ggml_tensor * dst, ggml_rpp_node * node) {
     return dst->ne[node->seq_len_index];
 }
 
-static ggml_rpp_node * ggml_rpp_find_unary_node(ggml_backend_rpp_context & ctx, ggml_tensor * dst) {
-    for (auto & graph_iter : ctx.gglm_graphs) {
-        ggml_rpp_cgraph * rpp_graph_tmp = ctx.rpp_graphs[graph_iter].get();
-        if (!rpp_graph_tmp) {
-            continue;
-        }
-        for (auto & node_iter : rpp_graph_tmp->rpp_nodes) {
-            if (node_iter.first != dst && node_iter.first->op == GGML_OP_UNARY) {
-                auto & node_vec = node_iter.second;
-                for (size_t i = 0; i < node_vec.size(); i++) {
-                    auto cur_node = node_vec[i].get();
-                    return cur_node;
-                }
-            }
-        }
-    }
-    return nullptr;
-}
-
 static bool ggml_rpp_create_kernel_gelu(ggml_backend_rpp_context & ctx,
                                         ggml_rpp_node *            rpp_base_node,
                                         ggml_tensor *              dst,
                                         int                        use_sram_direct = 0) {
+    (void) use_sram_direct;
     GGML_ASSERT(rpp_base_node);
     auto                rpp_node = static_cast<rpp_kernel_unary *>(rpp_base_node);
     const ggml_tensor * src0     = dst->src[0];
@@ -42,7 +24,8 @@ static bool ggml_rpp_create_kernel_gelu(ggml_backend_rpp_context & ctx,
     // 2:x split along split axis;y= GELU(x0)*x1 (one-input packed x)
     GGML_ASSERT(dst->op == GGML_OP_UNARY);
     const auto unary_op = ggml_get_unary_op(dst);
-    GGML_ASSERT(unary_op == GGML_UNARY_OP_GELU || unary_op == GGML_UNARY_OP_GELU_ERF);
+    GGML_ASSERT(unary_op == GGML_UNARY_OP_GELU || unary_op == GGML_UNARY_OP_GELU_ERF ||
+                unary_op == GGML_UNARY_OP_GELU_QUICK);
     const int mode = 0;
 
     const int seq_len = ggml_rpp_unary_seq_len(dst, rpp_node);
@@ -52,18 +35,24 @@ static bool ggml_rpp_create_kernel_gelu(ggml_backend_rpp_context & ctx,
 
     // set io buffer info to rpp_node
     void * inputs_0_buf = src0->data;
-    void * inputs_1_buf = nullptr;
     rpp_node->kernel_ctx->dev_in.emplace_back((RPPdeviceptr) inputs_0_buf);
     rpp_node->kernel_ctx->dev_out.emplace_back((RPPdeviceptr) (dst->data));
     rpp_node->binding_i_buffers.emplace(dst->src[0], inputs_0_buf);
     rpp_node->binding_o_buffers.emplace(dst, dst->data);
     rpp_node->binding_io_buffers.emplace_back(inputs_0_buf);
     rpp_node->binding_io_buffers.emplace_back(dst->data);
-    
+
     const int i_type_size = ggml_rpp_get_io_type_size(ctx, dst->src[0], 0);
     const int o_type_size = ggml_rpp_get_io_type_size(ctx, dst, 1);
     // build kernel, can use geglu kernel for unary glu
+    int gelu_variant = 0;
+    if (unary_op == GGML_UNARY_OP_GELU_ERF) {
+        gelu_variant = 1;
+    } else if (unary_op == GGML_UNARY_OP_GELU_QUICK) {
+        gelu_variant = 2;
+    }
     kernel_geglu_erf::rpp_gelu_build(*(rpp_node->kernel_ctx.get()), mode, C, H, W, 1, i_type_size, o_type_size,
+                                     gelu_variant,
                                      rpp_node->is_instantial);
     return true;
 }
@@ -90,6 +79,7 @@ static bool ggml_rpp_create_kernel_dispatch(ggml_backend_rpp_context & ctx,
     switch (ggml_get_unary_op(dst)) {
         case GGML_UNARY_OP_GELU:
         case GGML_UNARY_OP_GELU_ERF:
+        case GGML_UNARY_OP_GELU_QUICK:
             ret = ggml_rpp_create_kernel_gelu(ctx, rpp_node, dst);
             break;
         default:
@@ -161,6 +151,7 @@ static bool ggml_rpp_launch_kernel(ggml_backend_rpp_context & ctx, ggml_tensor *
     switch (ggml_get_unary_op(dst)) {
         case GGML_UNARY_OP_GELU:
         case GGML_UNARY_OP_GELU_ERF:
+        case GGML_UNARY_OP_GELU_QUICK:
             {
                 try {
                     RPP_LAUNCH_KERNEL(rpp_node->kernel_ctx->graphexec, ctx.stream());

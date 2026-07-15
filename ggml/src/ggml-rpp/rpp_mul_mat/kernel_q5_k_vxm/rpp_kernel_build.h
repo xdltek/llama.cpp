@@ -299,7 +299,7 @@ static void rpp_matmul_q5k_vxm(rpp_kernel_context & ctx,
 
     // Capture on kernelStream (like CUDA graph capture pattern)
     rppStreamBeginCapture(ctx.kernelStream, RPP_STREAM_CAPTURE_MODE_GLOBAL);
-    rppModuleLoad(&ctx.rppBinMod, "rpp_kernel/matmul_q5k_vxm.o");
+    rpp_module_load_once(ctx.rppBinMod, "rpp_kernel/matmul_q5k_vxm.o");
     // -------------------------
     // SRAM allocation planning
     // -------------------------
@@ -642,8 +642,9 @@ static void rpp_matmul_q5k_vxm(rpp_kernel_context & ctx,
 
     // End capture after all enqueued work is defined
     rppStreamEndCapture(ctx.kernelStream, &ctx.graph);
-    if (is_instantial) {
-        rppGraphInstantiate(&ctx.graphexec, ctx.graph, NULL, NULL, 0);
+    const std::string graph_key = rpp_join_function_name_and_args(__func__, M, K, N, weights_group, in_bytes_per_element, out_bytes_per_element);
+    if (rpp_graph_instantiate(ctx.graphexec, ctx.graph, graph_key.c_str(), is_instantial) != RPP_SUCCESS) {
+        throw std::runtime_error("rpp_graph_instantiate failed.");
     }
 }
 
@@ -674,7 +675,7 @@ static bool rpp_matmul_q5k_vxm_pipeline(rpp_kernel_context & ctx,
     const RPPdeviceptr devB_super_zero_base  = ctx.dev_in[8];
     RPPdeviceptr       devC                  = ctx.dev_out[0];
 
-    rppModuleLoad(&ctx.rppBinMod, "rpp_kernel/matmul_q5k_vxm.o");
+    rpp_module_load_once(ctx.rppBinMod, "rpp_kernel/matmul_q5k_vxm.o");
 
     const int logical_N = N;
     int       nr_of_tiles, groups_per_tile;
@@ -1208,8 +1209,9 @@ static bool rpp_matmul_q5k_vxm_pipeline(rpp_kernel_context & ctx,
     }
 
     rppStreamEndCapture(ctx.kernelStream, &ctx.graph);
-    if (is_instantial) {
-        rppGraphInstantiate(&ctx.graphexec, ctx.graph, NULL, NULL, 0);
+    const std::string graph_key = rpp_join_function_name_and_args(__func__, M, K, N, weights_group, in_bytes_per_element, out_bytes_per_element);
+    if (rpp_graph_instantiate(ctx.graphexec, ctx.graph, graph_key.c_str(), is_instantial) != RPP_SUCCESS) {
+        throw std::runtime_error("rpp_graph_instantiate failed.");
     }
     return true;
 }

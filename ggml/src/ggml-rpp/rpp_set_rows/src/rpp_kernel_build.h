@@ -38,7 +38,7 @@ void rpp_set_rows_build(rpp_kernel_context & ctx,
 
     rppStreamBeginCapture(ctx.kernelStream, RPP_STREAM_CAPTURE_MODE_GLOBAL);
     RPPmodule cuMod;
-    rppModuleLoad(&ctx.rppBinMod, "rpp_kernel/set_rows.o");
+    rpp_module_load_once(ctx.rppBinMod, "rpp_kernel/set_rows.o");
 
     RPPdeviceptr sram_base  = ctx.virtual_sram_base;
     RPPdeviceptr sram_baseA = sram_base + SET_ROW_MAX_ELEM;
@@ -122,7 +122,10 @@ void rpp_set_rows_build(rpp_kernel_context & ctx,
                            ctx.kernelStream);
     }
     rppStreamEndCapture(ctx.kernelStream, &ctx.graph);
-    if (is_instantial) {
-        rppGraphInstantiate(&ctx.graphexec, ctx.graph, NULL, NULL, 0);
+    const std::string graph_key =
+        rpp_join_function_name_and_args(__func__, elements_per_row, in_bytes_per_element, out_bytes_per_element);
+    // Row kernels encode runtime physical row-id/data addresses in kparams, so they cannot share kpara.
+    if (rpp_graph_instantiate(ctx.graphexec, ctx.graph, graph_key.c_str(), is_instantial, false) != RPP_SUCCESS) {
+        throw std::runtime_error("rpp_graph_instantiate failed.");
     }
 }

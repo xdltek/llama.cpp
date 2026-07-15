@@ -84,37 +84,6 @@ static void ggml_rpp_get_rows_cpy(const void *    src,
     // RPP_CHECK(rppMemcpyLinkDtoDAsync(...));
 }
 
-static ggml_rpp_node * ggml_rpp_find_mul_mat_id_node(ggml_backend_rpp_context & ctx,
-                                                     ggml_rpp_node *            rpp_node,
-                                                     ggml_tensor *              dst) {
-    for (auto & graph_iter : ctx.gglm_graphs) {
-        ggml_rpp_cgraph * rpp_graph_tmp = ctx.rpp_graphs[graph_iter].get();
-        if (!rpp_graph_tmp) {
-            continue;
-        }
-        for (auto & node_iter : rpp_graph_tmp->rpp_nodes) {
-            if (node_iter.first != dst && node_iter.first->op == GGML_OP_MUL_MAT_ID &&
-                node_iter.first->src[0]->type == dst->src[0]->type) {
-                auto & node_vec = node_iter.second;
-                for (size_t i = 0; i < node_vec.size(); i++) {
-                    auto cur_node = node_vec[i].get();
-                    // beacuse of this type prefill and decode kernel share the not same workspace, so we need to check the n_ubatch
-                    if (dst->src[0]->type == GGML_TYPE_IQ2_XS || dst->src[0]->type == GGML_TYPE_IQ2_S ||
-                        dst->src[0]->type == GGML_TYPE_IQ3_XXS) {
-                        auto cur_rpp_node = static_cast<rpp_kernel_mul_mat_id *>(cur_node);
-                        if (rpp_node->n_ubatch == cur_rpp_node->n_ubatch) {
-                            return cur_node;
-                        }
-                    } else {
-                        return cur_node;
-                    }
-                }
-            }
-        }
-    }
-    return nullptr;
-}
-
 static bool ggml_rpp_mat_mul_properties_is_same(ggml_backend_rpp_context & ctx,
                                                 ggml_tensor *              dst,
                                                 ggml_rpp_node *            rpp_node) {
@@ -215,15 +184,6 @@ static bool ggml_rpp_create_kernel_q4_1(ggml_backend_rpp_context & ctx,
     rpp_node->pool_buffers.emplace(weights_buf);
     rpp_node->pool_buffers.emplace(outputs_buf);
 
-    // find first rms_node, and all mul_mat_id kernel will shared the same workspace
-    auto ori_rpp_node = ggml_rpp_find_mul_mat_id_node(ctx, rpp_node, dst);
-    if (ori_rpp_node) {
-        auto ori_rms_node = static_cast<rpp_kernel_mul_mat_id *>(ori_rpp_node);
-        rpp_node->init_workspace(ori_rms_node->kernel_ctx->dev_workspace);
-    } else {
-        rpp_node->init_workspace(ctx);
-    }
-
     const int i_type_size = ggml_rpp_get_io_type_size(ctx, dst->src[1], 0);
     const int o_type_size = ggml_rpp_get_io_type_size(ctx, dst, 1);
     // build q4_1 kernel
@@ -283,15 +243,6 @@ static bool ggml_rpp_create_kernel_q8_0(ggml_backend_rpp_context & ctx,
     rpp_node->pool_buffers.emplace(inputs_0_buf);
     rpp_node->pool_buffers.emplace(weights_buf);
     rpp_node->pool_buffers.emplace(outputs_buf);
-
-    // find first rms_node, and all mul_mat_id kernel will shared the same workspace
-    auto ori_rpp_node = ggml_rpp_find_mul_mat_id_node(ctx, rpp_node, dst);
-    if (ori_rpp_node) {
-        auto ori_rms_node = static_cast<rpp_kernel_mul_mat_id *>(ori_rpp_node);
-        rpp_node->init_workspace(ori_rms_node->kernel_ctx->dev_workspace);
-    } else {
-        rpp_node->init_workspace(ctx);
-    }
 
     const int i_type_size = ggml_rpp_get_io_type_size(ctx, dst->src[1], 0);
     const int o_type_size = ggml_rpp_get_io_type_size(ctx, dst, 1);
@@ -361,15 +312,6 @@ static bool ggml_rpp_create_kernel_q6_k(ggml_backend_rpp_context & ctx,
     rpp_node->pool_buffers.emplace(inputs_0_buf);
     rpp_node->pool_buffers.emplace(weights_buf);
     rpp_node->pool_buffers.emplace(outputs_buf);
-
-    // find first rms_node, and all mul_mat_id kernel will shared the same workspace
-    auto ori_rpp_node = ggml_rpp_find_mul_mat_id_node(ctx, rpp_node, dst);
-    if (ori_rpp_node) {
-        auto ori_rms_node = static_cast<rpp_kernel_mul_mat_id *>(ori_rpp_node);
-        rpp_node->init_workspace(ori_rms_node->kernel_ctx->dev_workspace);
-    } else {
-        rpp_node->init_workspace(ctx);
-    }
 
     const int i_type_size = ggml_rpp_get_io_type_size(ctx, dst->src[1], 0);
     const int o_type_size = ggml_rpp_get_io_type_size(ctx, dst, 1);
@@ -446,14 +388,6 @@ static bool ggml_rpp_create_kernel_q4_k(ggml_backend_rpp_context & ctx,
     rpp_node->pool_buffers.emplace(inputs_0_buf);
     rpp_node->pool_buffers.emplace(weights_buf);
     rpp_node->pool_buffers.emplace(outputs_buf);
-
-    auto ori_rpp_node = ggml_rpp_find_mul_mat_id_node(ctx, rpp_node, dst);
-    if (ori_rpp_node) {
-        auto ori_rms_node = static_cast<rpp_kernel_mul_mat_id *>(ori_rpp_node);
-        rpp_node->init_workspace(ori_rms_node->kernel_ctx->dev_workspace);
-    } else {
-        rpp_node->init_workspace(ctx);
-    }
 
     const int i_type_size = ggml_rpp_get_io_type_size(ctx, dst->src[1], 0);
     const int o_type_size = ggml_rpp_get_io_type_size(ctx, dst, 1);
@@ -534,14 +468,6 @@ static bool ggml_rpp_create_kernel_q5_k(ggml_backend_rpp_context & ctx,
     rpp_node->pool_buffers.emplace(weights_buf);
     rpp_node->pool_buffers.emplace(outputs_buf);
 
-    auto ori_rpp_node = ggml_rpp_find_mul_mat_id_node(ctx, rpp_node, dst);
-    if (ori_rpp_node) {
-        auto ori_rms_node = static_cast<rpp_kernel_mul_mat_id *>(ori_rpp_node);
-        rpp_node->init_workspace(ori_rms_node->kernel_ctx->dev_workspace);
-    } else {
-        rpp_node->init_workspace(ctx);
-    }
-
     const int i_type_size = ggml_rpp_get_io_type_size(ctx, dst->src[1], 0);
     const int o_type_size = ggml_rpp_get_io_type_size(ctx, dst, 1);
     if (M == 1) {
@@ -608,14 +534,6 @@ static bool ggml_rpp_create_kernel_iq3_xxs_lut(ggml_backend_rpp_context & ctx,
     rpp_node->pool_buffers.emplace(weights_buf);
     rpp_node->pool_buffers.emplace(outputs_buf);
 
-    auto ori_rpp_node = ggml_rpp_find_mul_mat_id_node(ctx, rpp_node, dst);
-    if (ori_rpp_node) {
-        auto ori_rms_node = static_cast<rpp_kernel_mul_mat_id *>(ori_rpp_node);
-        rpp_node->init_workspace(ori_rms_node->kernel_ctx->dev_workspace);
-    } else {
-        rpp_node->init_workspace(ctx);
-    }
-
     const int i_type_size = ggml_rpp_get_io_type_size(ctx, dst->src[1], 0);
     const int o_type_size = ggml_rpp_get_io_type_size(ctx, dst, 1);
     if (M == 1) {
@@ -680,14 +598,6 @@ static bool ggml_rpp_create_kernel_iq3_xxs_lut_sram(ggml_backend_rpp_context & c
     rpp_node->pool_buffers.emplace(dst->src[0]->data);
     rpp_node->pool_buffers.emplace(dst->data);
 
-    auto ori_rpp_node = ggml_rpp_find_mul_mat_id_node(ctx, rpp_node, dst);
-    if (ori_rpp_node) {
-        auto ori_rms_node = static_cast<rpp_kernel_mul_mat_id *>(ori_rpp_node);
-        rpp_node->init_workspace(ori_rms_node->kernel_ctx->dev_workspace);
-    } else {
-        rpp_node->init_workspace(ctx);
-    }
-
     if (M == 1) {
         kernel_q3_xxs_vxm::rpp_matmul_q3xxs_vxm_build(*(rpp_node->kernel_ctx.get()), M, K, N, QK_K, i_type_size,
                                                       o_type_size, 1, 1, n_expert, rpp_node->is_instantial);
@@ -750,14 +660,6 @@ static bool ggml_rpp_create_kernel_iq3_xxs_nolut(ggml_backend_rpp_context & ctx,
     rpp_node->pool_buffers.emplace(inputs_0_buf);
     rpp_node->pool_buffers.emplace(weights_buf);
     rpp_node->pool_buffers.emplace(outputs_buf);
-
-    auto ori_rpp_node = ggml_rpp_find_mul_mat_id_node(ctx, rpp_node, dst);
-    if (ori_rpp_node) {
-        auto ori_rms_node = static_cast<rpp_kernel_mul_mat_id *>(ori_rpp_node);
-        rpp_node->init_workspace(ori_rms_node->kernel_ctx->dev_workspace);
-    } else {
-        rpp_node->init_workspace(ctx);
-    }
 
     const int i_type_size = ggml_rpp_get_io_type_size(ctx, dst->src[1], 0);
     const int o_type_size = ggml_rpp_get_io_type_size(ctx, dst, 1);
@@ -823,14 +725,6 @@ static bool ggml_rpp_create_kernel_iq3_xxs_nolut_sram(ggml_backend_rpp_context &
     rpp_node->pool_buffers.emplace(dst->src[1]->data);
     rpp_node->pool_buffers.emplace(dst->src[0]->data);
     rpp_node->pool_buffers.emplace(dst->data);
-
-    auto ori_rpp_node = ggml_rpp_find_mul_mat_id_node(ctx, rpp_node, dst);
-    if (ori_rpp_node) {
-        auto ori_rms_node = static_cast<rpp_kernel_mul_mat_id *>(ori_rpp_node);
-        rpp_node->init_workspace(ori_rms_node->kernel_ctx->dev_workspace);
-    } else {
-        rpp_node->init_workspace(ctx);
-    }
 
     if (M == 1) {
         kernel_q3_xxs_vxm_nolut::q3xxs_vxm_nolut_prepare_lut_workspace(*(rpp_node->kernel_ctx.get()));
@@ -921,14 +815,6 @@ static bool ggml_rpp_create_kernel_iq2_s_lut(ggml_backend_rpp_context & ctx,
     rpp_node->pool_buffers.emplace(weights_buf);
     rpp_node->pool_buffers.emplace(outputs_buf);
 
-    auto ori_rpp_node = ggml_rpp_find_mul_mat_id_node(ctx, rpp_node, dst);
-    if (ori_rpp_node) {
-        auto ori_rms_node = static_cast<rpp_kernel_mul_mat_id *>(ori_rpp_node);
-        rpp_node->init_workspace(ori_rms_node->kernel_ctx->dev_workspace);
-    } else {
-        rpp_node->init_workspace(ctx);
-    }
-
     const int i_type_size = ggml_rpp_get_io_type_size(ctx, dst->src[1], 0);
     const int o_type_size = ggml_rpp_get_io_type_size(ctx, dst, 1);
     if (M == 1) {
@@ -993,14 +879,6 @@ static bool ggml_rpp_create_kernel_iq2_s_nolut(ggml_backend_rpp_context & ctx,
     rpp_node->pool_buffers.emplace(weights_buf);
     rpp_node->pool_buffers.emplace(outputs_buf);
 
-    auto ori_rpp_node = ggml_rpp_find_mul_mat_id_node(ctx, rpp_node, dst);
-    if (ori_rpp_node) {
-        auto ori_rms_node = static_cast<rpp_kernel_mul_mat_id *>(ori_rpp_node);
-        rpp_node->init_workspace(ori_rms_node->kernel_ctx->dev_workspace);
-    } else {
-        rpp_node->init_workspace(ctx);
-    }
-
     const int i_type_size = ggml_rpp_get_io_type_size(ctx, dst->src[1], 0);
     const int o_type_size = ggml_rpp_get_io_type_size(ctx, dst, 1);
     if (M == 1) {
@@ -1064,14 +942,6 @@ static bool ggml_rpp_create_kernel_iq2_s_nolut_sram(ggml_backend_rpp_context & c
     rpp_node->pool_buffers.emplace(dst->src[1]->data);
     rpp_node->pool_buffers.emplace(dst->src[0]->data);
     rpp_node->pool_buffers.emplace(dst->data);
-
-    auto ori_rpp_node = ggml_rpp_find_mul_mat_id_node(ctx, rpp_node, dst);
-    if (ori_rpp_node) {
-        auto ori_rms_node = static_cast<rpp_kernel_mul_mat_id *>(ori_rpp_node);
-        rpp_node->init_workspace(ori_rms_node->kernel_ctx->dev_workspace);
-    } else {
-        rpp_node->init_workspace(ctx);
-    }
 
     if (M == 1) {
         kernel_q2_s_vxm_nolut::q2s_vxm_nolut_prepare_lut_workspace(*(rpp_node->kernel_ctx.get()));
@@ -1153,14 +1023,6 @@ static bool ggml_rpp_create_kernel_iq2_xs_lut(ggml_backend_rpp_context & ctx,
     rpp_node->pool_buffers.emplace(weights_buf);
     rpp_node->pool_buffers.emplace(outputs_buf);
 
-    auto ori_rpp_node = ggml_rpp_find_mul_mat_id_node(ctx, rpp_node, dst);
-    if (ori_rpp_node) {
-        auto ori_rms_node = static_cast<rpp_kernel_mul_mat_id *>(ori_rpp_node);
-        rpp_node->init_workspace(ori_rms_node->kernel_ctx->dev_workspace);
-    } else {
-        rpp_node->init_workspace(ctx);
-    }
-
     const int i_type_size = ggml_rpp_get_io_type_size(ctx, dst->src[1], 0);
     const int o_type_size = ggml_rpp_get_io_type_size(ctx, dst, 1);
 
@@ -1227,14 +1089,6 @@ static bool ggml_rpp_create_kernel_iq2_xs_nolut(ggml_backend_rpp_context & ctx,
     rpp_node->pool_buffers.emplace(weights_buf);
     rpp_node->pool_buffers.emplace(outputs_buf);
 
-    auto ori_rpp_node = ggml_rpp_find_mul_mat_id_node(ctx, rpp_node, dst);
-    if (ori_rpp_node) {
-        auto ori_rms_node = static_cast<rpp_kernel_mul_mat_id *>(ori_rpp_node);
-        rpp_node->init_workspace(ori_rms_node->kernel_ctx->dev_workspace);
-    } else {
-        rpp_node->init_workspace(ctx);
-    }
-
     const int i_type_size = ggml_rpp_get_io_type_size(ctx, dst->src[1], 0);
     const int o_type_size = ggml_rpp_get_io_type_size(ctx, dst, 1);
     if (M == 1) {
@@ -1299,14 +1153,6 @@ static bool ggml_rpp_create_kernel_iq2_xs_nolut_sram(ggml_backend_rpp_context & 
     rpp_node->pool_buffers.emplace(dst->src[1]->data);
     rpp_node->pool_buffers.emplace(dst->src[0]->data);
     rpp_node->pool_buffers.emplace(dst->data);
-
-    auto ori_rpp_node = ggml_rpp_find_mul_mat_id_node(ctx, rpp_node, dst);
-    if (ori_rpp_node) {
-        auto ori_rms_node = static_cast<rpp_kernel_mul_mat_id *>(ori_rpp_node);
-        rpp_node->init_workspace(ori_rms_node->kernel_ctx->dev_workspace);
-    } else {
-        rpp_node->init_workspace(ctx);
-    }
 
     if (M == 1) {
         kernel_q2_xs_vxm_nolut::q2xs_vxm_nolut_prepare_lut_workspace(*(rpp_node->kernel_ctx.get()));
@@ -1376,15 +1222,6 @@ static bool ggml_rpp_create_kernel_bf16(ggml_backend_rpp_context & ctx,
     rpp_node->binding_io_buffers.emplace_back(inputs_0_buf);
     rpp_node->binding_io_buffers.emplace_back(weights_buf);
     rpp_node->binding_io_buffers.emplace_back(outputs_buf);
-
-    // find first rms_node, and all rms_norm kernel will shared the same workspace
-    auto ori_rpp_node = ggml_rpp_find_mul_mat_id_node(ctx, rpp_node, dst);
-    if (ori_rpp_node) {
-        auto ori_rms_node = static_cast<rpp_kernel_mul_mat_id *>(ori_rpp_node);
-        rpp_node->init_workspace(ori_rms_node->kernel_ctx->dev_workspace);
-    } else {
-        rpp_node->init_workspace(ctx);
-    }
 
     const int i_type_size = ggml_rpp_get_io_type_size(ctx, dst->src[1], 0);
     const int o_type_size = ggml_rpp_get_io_type_size(ctx, dst, 1);
@@ -1630,6 +1467,7 @@ bool ggml_rpp_launch_kernel_sram(ggml_backend_rpp_context & ctx, ggml_rpp_node *
                         byte_count.emplace_back(qscale_lut_bytes);
                         byte_count.emplace_back(mag_lut_bytes);
                     }
+                    break;
                 case GGML_TYPE_IQ2_XS:
                     {
                         RPPdeviceptr       base_ptr         = kernel_ctx->dev_workspace;
@@ -1653,28 +1491,21 @@ bool ggml_rpp_launch_kernel_sram(ggml_backend_rpp_context & ctx, ggml_rpp_node *
                         RPPdeviceptr base_ptr     = kernel_ctx->dev_workspace;
                         const size_t qscale_bytes = q3xxs_vxm_nolut_lut_workspace::qscale_lut_bytes;
                         const size_t mag_bytes    = q3xxs_vxm_nolut_lut_workspace::mag_lut_bytes;
-                        const size_t mat_bytes    = q3xxs_vxm_nolut_lut_workspace::mat_lut_bytes;
                         const size_t off_qscale   = 0;
                         const size_t off_mag      = kernel_q3_xxs_vxm_nolut::align_up(off_qscale + qscale_bytes, 64);
-                        const size_t off_mat      = kernel_q3_xxs_vxm_nolut::align_up(off_mag + mag_bytes, 64);
 
                         const RPPdeviceptr deviB_qscale_lut = base_ptr + (RPPdeviceptr) off_qscale;
                         const RPPdeviceptr deviB_mag_lut    = base_ptr + (RPPdeviceptr) off_mag;
-                        const RPPdeviceptr deviB_mat_lut    = base_ptr + (RPPdeviceptr) off_mat;
 
                         const RPPdeviceptr sramB_qscale_lut = kernel_ctx->dev_in[5];
                         const RPPdeviceptr sramB_mag_lut    = kernel_ctx->dev_in[6];
-                        const RPPdeviceptr sramB_mat_lut    = kernel_ctx->dev_in[7];
 
                         dst_sram.emplace_back(sramB_qscale_lut);
                         dst_sram.emplace_back(sramB_mag_lut);
-                        dst_sram.emplace_back(sramB_mat_lut);
                         src_devi.emplace_back(deviB_qscale_lut);
                         src_devi.emplace_back(deviB_mag_lut);
-                        src_devi.emplace_back(deviB_mat_lut);
                         byte_count.emplace_back(qscale_bytes);
                         byte_count.emplace_back(mag_bytes);
-                        byte_count.emplace_back(mat_bytes);
                     }
                     break;
                 default:

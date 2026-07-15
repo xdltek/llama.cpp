@@ -35,14 +35,39 @@ struct rpp_dfs_state {
 std::mutex                             g_rpp_dfs_mutex;
 std::unordered_map<int, rpp_dfs_state> g_rpp_dfs_states;
 
+std::mutex                                            g_rpp_function_cache_mutex;
+std::unordered_map<RPPmodule, std::unordered_map<std::string, RPPfunction>> g_rpp_function_cache;
+
+int get_cached_device() {
+    thread_local int device = -1;
+    if (device < 0) {
+        const auto get_dev_res = rtGetDevice(&device);
+        assert(get_dev_res == rtSuccess);
+    }
+    return device;
+}
+
+RPPfunction get_cached_function(RPPmodule cuMod, const std::string & kernName) {
+    std::lock_guard<std::mutex> lock(g_rpp_function_cache_mutex);
+    auto &                      module_cache = g_rpp_function_cache[cuMod];
+    auto                        it           = module_cache.find(kernName);
+    if (it != module_cache.end()) {
+        return it->second;
+    }
+
+    RPPfunction hfunc = nullptr;
+    RPPresult   res   = rppModuleGetFunction(&hfunc, cuMod, kernName.c_str());
+    assert(res == RPP_SUCCESS);
+    module_cache.emplace(kernName, hfunc);
+    return hfunc;
+}
+
 void maybe_set_kernel_dfs_frequency(const std::string & kernName, dim3 threadsPerBlock, RPPstream kernelStream) {
     const int total_threads =
         static_cast<int>(threadsPerBlock.x) * static_cast<int>(threadsPerBlock.y) * static_cast<int>(threadsPerBlock.z);
     const int current_frequency =
         Kernel2Frequency(kernName, total_threads, RPP_FREQ_LEVEL2, RPP_FREQ_LEVEL2, RPP_FREQ_LEVEL1);
-    int        device      = -1;
-    const auto get_dev_res = rtGetDevice(&device);
-    assert(get_dev_res == rtSuccess);
+    const int device = get_cached_device();
 
     bool need_set           = false;
     int  previous_frequency = -1;
@@ -144,7 +169,11 @@ bool tryCustomKernelLaunch(const std::string &     kernName,
                            RPPstream               kernelStream) {
     (void) threadsPerBlockTail;
 
-    if (kernName != "opt_vector_cvt_f16_f32_opt" || blocksPerGrid.x <= 1 || (threadsPerBlock.x % 32) == 0) {
+    const bool is_cvt_f16_f32 =
+        kernName == "opt_vector_cvt_f16_f32_opt" || kernName == "opt_vector_cvt_f16_f32_v2";
+    const bool is_cvt_32_16 = kernName == "opt_vector_cvt_32_16";
+
+    if ((!is_cvt_f16_f32 && !is_cvt_32_16) || blocksPerGrid.x <= 1 || (threadsPerBlock.x % 32) == 0) {
         return false;
     }
 
@@ -154,39 +183,29 @@ bool tryCustomKernelLaunch(const std::string &     kernName,
     const RppDataType outDataType  = (RppDataType) kparams[3];
     const uint32_t    inAddr       = kparams[0];
     const uint32_t    outAddr      = kparams[1];
-    const uint32_t    inElemSize   = (uint32_t) GetRppElementSize(inDataType);
-    const uint32_t    outElemSize  = (uint32_t) GetRppElementSize(outDataType);
-    const uint32_t    totalInBytes = threadsPerBlock.x * blocksPerGrid.x;
+    const uint32_t    totalUnits   = threadsPerBlock.x * blocksPerGrid.x;
     const uint32_t    normalBlockX = (threadsPerBlock.x / 32) * 32;
 
     assert(normalBlockX > 0);
 
-    RPPresult   res;
-    RPPfunction hfunc;
-    res = rppModuleGetFunction(&hfunc, cuMod, kernName.c_str());
-    assert(res == RPP_SUCCESS);
+    RPPfunction hfunc = get_cached_function(cuMod, kernName);
 
-    const uint32_t normalGridX   = totalInBytes / normalBlockX;
-    const uint32_t tailInBytes   = totalInBytes % normalBlockX;
-    const uint32_t normalInBytes = normalGridX * normalBlockX;
-
-    if (normalGridX > 0) {
-        dim3                  normalBlocks(normalGridX, blocksPerGrid.y, blocksPerGrid.z);
-        dim3                  normalThreads(normalBlockX, threadsPerBlock.y, threadsPerBlock.z);
-        std::vector<uint32_t> normalParams;
-        cvt_kernel_param_init_opt(normalThreads, inAddr, outAddr, inDataType, outDataType, normalParams);
-        launchKernelRaw(hfunc, kernName, normalBlocks, normalThreads, normalThreads, normalParams, kernelStream);
+    const uint32_t fullBlocks = totalUnits / normalBlockX;
+    const uint32_t tailUnits  = totalUnits % normalBlockX;
+    dim3           launchBlocks(fullBlocks + (tailUnits > 0 ? 1u : 0u), blocksPerGrid.y, blocksPerGrid.z);
+    dim3           launchThreads(normalBlockX, threadsPerBlock.y, threadsPerBlock.z);
+    dim3           launchTail(normalBlockX, threadsPerBlock.y, threadsPerBlock.z);
+    if (tailUnits > 0) {
+        launchTail.x = tailUnits;
     }
 
-    if (tailInBytes > 0) {
-        dim3                  tailBlocks(1, blocksPerGrid.y, blocksPerGrid.z);
-        dim3                  tailThreads(tailInBytes, threadsPerBlock.y, threadsPerBlock.z);
-        std::vector<uint32_t> tailParams;
-        cvt_kernel_param_init_opt(tailThreads, inAddr + normalInBytes,
-                                  outAddr + (normalInBytes / inElemSize) * outElemSize, inDataType, outDataType,
-                                  tailParams);
-        launchKernelRaw(hfunc, kernName, tailBlocks, tailThreads, tailThreads, tailParams, kernelStream);
+    std::vector<uint32_t> launchParams;
+    if (is_cvt_f16_f32) {
+        cvt_kernel_param_init_opt(launchThreads, inAddr, outAddr, inDataType, outDataType, launchParams);
+    } else {
+        cvt_kernel_param_init(launchThreads, inAddr, outAddr, inDataType, outDataType, launchParams);
     }
+    launchKernelRaw(hfunc, kernName, launchBlocks, launchThreads, launchTail, launchParams, kernelStream);
 
     return true;
 }
@@ -209,7 +228,6 @@ void launchWrapperAysnc(string                  kernName,
                         std::vector<uint32_t> & kparams,
                         RPPmodule               cuMod,
                         RPPstream               kernelStream) {
-    RPPresult   res;
     RPPfunction hfunc;
     dim3        threadsPerBlockTail = threadsPerBlock;
     assert(threadsPerBlock.x * threadsPerBlock.y * threadsPerBlock.z < 8192);
@@ -220,8 +238,7 @@ void launchWrapperAysnc(string                  kernName,
 
     adjustKernelLaunchConfig(kernName, blocksPerGrid, threadsPerBlock, threadsPerBlockTail, kparams);
 
-    res = rppModuleGetFunction(&hfunc, cuMod, kernName.c_str());
-    assert(res == RPP_SUCCESS);
+    hfunc = get_cached_function(cuMod, kernName);
     launchKernelRaw(hfunc, kernName, blocksPerGrid, threadsPerBlock, threadsPerBlockTail, kparams, kernelStream);
 }
 
@@ -232,7 +249,6 @@ void launchWrapperAysnc(string                  kernName,
                         std::vector<uint32_t> & kparams,
                         RPPmodule               cuMod,
                         RPPstream               kernelStream) {
-    RPPresult   res;
     RPPfunction hfunc;
 
     if (tryCustomKernelLaunch(kernName, blocksPerGrid, threadsPerBlock, threadsPerBlockTail, kparams, cuMod,
@@ -242,8 +258,7 @@ void launchWrapperAysnc(string                  kernName,
 
     adjustKernelLaunchConfig(kernName, blocksPerGrid, threadsPerBlock, threadsPerBlockTail, kparams);
 
-    res = rppModuleGetFunction(&hfunc, cuMod, kernName.c_str());
-    assert(res == RPP_SUCCESS);
+    hfunc = get_cached_function(cuMod, kernName);
     launchKernelRaw(hfunc, kernName, blocksPerGrid, threadsPerBlock, threadsPerBlockTail, kparams, kernelStream);
 }
 

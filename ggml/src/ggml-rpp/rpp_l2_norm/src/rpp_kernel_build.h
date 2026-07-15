@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <cstring>
 #include <iostream>
+#include <mutex>
 #include <stdexcept>
 #include <vector>
 
@@ -21,6 +22,41 @@ inline int round_up_to_32(int a) {
 
 inline int get_l2norm_rsqrt_max_rows() {
     return KDC_H_MAX_THREAD_NUM;
+}
+
+inline RPPdeviceptr l2norm_prepare_rsqrt_lut_workspace(rpp_kernel_context & ctx) {
+    constexpr int lut_elements = 64 * 1024;
+    constexpr int lut_bytes    = lut_elements * (int) sizeof(uint16_t);
+    static std::mutex   mutex;
+    static RPPdeviceptr kernel_lut_workspace = 0;
+
+    std::lock_guard<std::mutex> lock(mutex);
+    if (kernel_lut_workspace == 0) {
+        if (rtMalloc((void **) &kernel_lut_workspace, lut_bytes) != rtSuccess) {
+            throw std::runtime_error("L2 norm rtMalloc failed for shared rsqrt LUT workspace");
+        }
+
+        std::vector<uint16_t> rsqrt_table(lut_elements);
+        for (uint32_t i = 0; i < (uint32_t) lut_elements; i++) {
+            uint32_t x = i;
+            x <<= 16;
+            float y        = 1.0f / std::sqrt((*(float *) &x));
+            rsqrt_table[i] = rpp::bfloat16::round_to_bfloat16(y).value;
+        }
+        rsqrt_table[0]      = 0;
+        rsqrt_table[0x8000] = 0;
+        rtMemcpy((void *) kernel_lut_workspace, (const void *) rsqrt_table.data(), lut_bytes, rtMemcpyHostToDevice);
+    }
+
+    RPPdeviceptr dev_lut_workspace = ctx.dev_workspace;
+    if (dev_lut_workspace == 0) {
+        ctx.dev_workspace = kernel_lut_workspace;
+        return kernel_lut_workspace;
+    }
+    if (dev_lut_workspace != kernel_lut_workspace) {
+        rtMemcpy((void *) dev_lut_workspace, (const void *) kernel_lut_workspace, lut_bytes, rtMemcpyDeviceToDevice);
+    }
+    return dev_lut_workspace;
 }
 
 inline int get_l2norm_tile_sram_bytes(int tile_rows,
@@ -98,22 +134,10 @@ static void rpp_l2norm_build(rpp_kernel_context & ctx,
     RPPdeviceptr          devA = ctx.dev_in[0];
     RPPdeviceptr          devB = ctx.dev_out[0];
 
-    int        lut_elements = 64 * 1024;
-    uint16_t * rsqrt_table  = (uint16_t *) malloc(lut_elements * sizeof(uint16_t));
-    for (uint32_t i = 0; i < (uint32_t) lut_elements; i++) {
-        uint32_t x = i;
-        x <<= 16;
-        float y        = 1.0f / std::sqrt((*(float *) &x));
-        rsqrt_table[i] = rpp::bfloat16::round_to_bfloat16(y).value;
-    }
-    rsqrt_table[0]      = 0;
-    rsqrt_table[0x8000] = 0;
-
-    RPPdeviceptr dev_rsqrt_lut = ctx.dev_workspace;
-    rtMemcpy((void *) dev_rsqrt_lut, (const void *) rsqrt_table, lut_elements * sizeof(short), rtMemcpyHostToDevice);
+    RPPdeviceptr dev_rsqrt_lut = l2norm_prepare_rsqrt_lut_workspace(ctx);
 
     rppStreamBeginCapture(ctx.kernelStream, RPP_STREAM_CAPTURE_MODE_GLOBAL);
-    rppModuleLoad(&ctx.rppBinMod, "rpp_kernel/rmsnorm.o");
+    rpp_module_load_once(ctx.rppBinMod, "rpp_kernel/rmsnorm.o");
 
     int max_tile_rows = rows;
     if (force_tiling_for_capacity || force_tiling_for_rsqrt) {
@@ -325,9 +349,12 @@ static void rpp_l2norm_build(rpp_kernel_context & ctx,
         }
     }
 
-    free(rsqrt_table);
     rppStreamEndCapture(ctx.kernelStream, &ctx.graph);
-    if (is_instantial) {
-        rppGraphInstantiate(&ctx.graphexec, ctx.graph, NULL, NULL, 0);
+    uint32_t eps_bits = 0;
+    memcpy(&eps_bits, &eps, sizeof(eps_bits));
+    const std::string graph_key =
+        rpp_join_function_name_and_args(__func__, rows, cols, eps_bits, in_bytes_per_element, out_bytes_per_element);
+    if (rpp_graph_instantiate(ctx.graphexec, ctx.graph, graph_key.c_str(), is_instantial) != RPP_SUCCESS) {
+        throw std::runtime_error("rpp_graph_instantiate failed.");
     }
 }

@@ -7,9 +7,11 @@
 
 #include <rpp_runtime.h>
 
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <iostream>
+#include <mutex>
 #include <vector>
 
 inline int round_len(const int ori_len) {
@@ -55,6 +57,65 @@ uint32_t inline CalcTopKInputRoundLen(uint32_t input_len) {
 
 unsigned int inline dim3_volume(const dim3 & dim) {
     return dim.x * dim.y * dim.z;
+}
+
+RPPdeviceptr inline rpp_expert_routing_prepare_lut_workspace(rpp_kernel_context & ctx, uint64_t lut_table_size) {
+    static std::mutex   mutex;
+    static RPPdeviceptr kernel_lut_workspace = 0;
+
+    std::lock_guard<std::mutex> lock(mutex);
+    const uint32_t lut_elements = (uint32_t) (lut_table_size / sizeof(uint16_t));
+    const uint64_t total_bytes  = lut_table_size * 2;
+
+    if (kernel_lut_workspace == 0) {
+        if (rtMalloc((void **) &kernel_lut_workspace, total_bytes) != rtSuccess) {
+            throw std::runtime_error("Failed to allocate expert routing shared LUT workspace.");
+        }
+
+        std::vector<uint16_t> exp_table(lut_elements);
+        for (uint32_t i = 0; i < lut_elements; i++) {
+            uint32_t x = i;
+            x <<= 16;
+            float y;
+            memcpy(&y, &x, sizeof(y));
+            y            = std::exp(y);
+            exp_table[i] = rpp::bfloat16::round_to_bfloat16(y).value;
+        }
+
+        std::vector<uint16_t> reciprocal_table(lut_elements);
+        for (uint32_t i = 0; i < lut_elements; i++) {
+            uint32_t x = i;
+            x <<= 16;
+            float y;
+            memcpy(&y, &x, sizeof(y));
+            y                   = 1.0f / y;
+            reciprocal_table[i] = rpp::bfloat16::round_to_bfloat16(y).value;
+        }
+        reciprocal_table[0]      = 0;
+        reciprocal_table[0x8000] = 0;
+
+        if (rtMemcpy((void *) kernel_lut_workspace, exp_table.data(), lut_table_size, rtMemcpyHostToDevice) !=
+            rtSuccess) {
+            throw std::runtime_error("Failed to copy exp table into DDR.");
+        }
+        if (rtMemcpy((void *) (kernel_lut_workspace + lut_table_size), reciprocal_table.data(), lut_table_size,
+                     rtMemcpyHostToDevice) != rtSuccess) {
+            throw std::runtime_error("Failed to copy reciprocal table into DDR.");
+        }
+    }
+
+    RPPdeviceptr dev_lut_workspace = ctx.dev_workspace;
+    if (dev_lut_workspace == 0) {
+        ctx.dev_workspace = kernel_lut_workspace;
+        return kernel_lut_workspace;
+    }
+    if (dev_lut_workspace != kernel_lut_workspace) {
+        if (rtMemcpy((void *) dev_lut_workspace, (const void *) kernel_lut_workspace, total_bytes,
+                     rtMemcpyDeviceToDevice) != rtSuccess) {
+            throw std::runtime_error("Failed to copy expert routing lookup table into DDR.");
+        }
+    }
+    return dev_lut_workspace;
 }
 
 void inline rt_task_to_rpp_config(const RppTaskElement &  rt_task,
@@ -151,37 +212,8 @@ void inline rpp_expert_routing_build(rpp_kernel_context & ctx,
         throw std::runtime_error("Invalid max_num_experts or num_experts.");
     }
 
-    uint64_t lut_table_size = 65536 * sizeof(uint16_t);
-
-    void * exp_table = malloc(lut_table_size);
-    for (uint32_t i = 0; i < 65536; i++) {
-        uint32_t x = i;
-        x <<= 16;
-        float y                     = exp(*(float *) &x);
-        ((uint16_t *) exp_table)[i] = rpp::bfloat16::round_to_bfloat16(y).value;
-    }
-
-    void * reciprocal_table = malloc(lut_table_size);
-    for (uint32_t i = 0; i < 65536; i++) {
-        uint32_t x = i;
-        x <<= 16;
-        float y                            = 1.0f / *(float *) &x;
-        ((uint16_t *) reciprocal_table)[i] = rpp::bfloat16::round_to_bfloat16(y).value;
-    }
-    // 0, -0
-    ((uint16_t *) reciprocal_table)[0]      = 0;
-    ((uint16_t *) reciprocal_table)[0x8000] = 0;
-
-    if (rtMemcpy((void *) ctx.dev_workspace, exp_table, lut_table_size, rtMemcpyHostToDevice) != rtSuccess) {
-        throw std::runtime_error("Failed to copy exp table into DDR.");
-    }
-    if (rtMemcpy((void *) (ctx.dev_workspace + lut_table_size), reciprocal_table, lut_table_size,
-                 rtMemcpyHostToDevice) != rtSuccess) {
-        throw std::runtime_error("Failed to copy reciprocal table into DDR.");
-    }
-
-    free(reciprocal_table);
-    free(exp_table);
+    uint64_t     lut_table_size = 65536 * sizeof(uint16_t);
+    RPPdeviceptr dev_lut_base   = rpp_expert_routing_prepare_lut_workspace(ctx, lut_table_size);
 
     uint64_t input_size_round = in_bytes_per_element == 4 ? sizeof(float) : sizeof(uint16_t);
     input_size_round *= round_len(num_tokens * max_num_experts);
@@ -201,11 +233,11 @@ void inline rpp_expert_routing_build(rpp_kernel_context & ctx,
         throw std::runtime_error("rppStreamBeginCapture failed.");
     }
 
-    if (rppModuleLoad(&ctx.rppBinMod, "rpp_kernel/expert_routing.o") != RPP_SUCCESS) {
+    if (rpp_module_load_once(ctx.rppBinMod, "rpp_kernel/expert_routing.o") != RPP_SUCCESS) {
         throw std::runtime_error("rppModuleLoad failed.");
     }
 
-    if (rtMemcpyAsync((void *) sram_exp_table_addr, (void *) ctx.dev_workspace, lut_table_size * 2,
+    if (rtMemcpyAsync((void *) sram_exp_table_addr, (void *) dev_lut_base, lut_table_size * 2,
                       rtMemcpyDeviceToSram, ctx.kernelStream) != rtSuccess) {
         throw std::runtime_error("Failed to copy lookup table to SRAM.");
     }
@@ -714,10 +746,11 @@ void inline rpp_expert_routing_build(rpp_kernel_context & ctx,
     if (rppStreamEndCapture(ctx.kernelStream, &ctx.graph) != RPP_SUCCESS) {
         throw std::runtime_error("rppStreamEndCapture failed.");
     }
-    if (is_instantial) {
-        if (rppGraphInstantiate(&ctx.graphexec, ctx.graph, nullptr, nullptr, 0) != RPP_SUCCESS) {
-            throw std::runtime_error("rppGraphInstantiate failed.");
-        }
+    const std::string graph_key =
+        rpp_join_function_name_and_args(__func__, num_tokens, max_num_experts, num_experts, in_bytes_per_element,
+                                        out_bytes_per_element);
+    if (rpp_graph_instantiate(ctx.graphexec, ctx.graph, graph_key.c_str(), is_instantial) != RPP_SUCCESS) {
+        throw std::runtime_error("rpp_graph_instantiate failed.");
     }
 }
 

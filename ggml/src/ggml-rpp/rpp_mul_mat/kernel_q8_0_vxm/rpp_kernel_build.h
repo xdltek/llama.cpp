@@ -78,7 +78,7 @@ static void rpp_matmul_q80_vxm(rpp_kernel_context & ctx,
     // Capture on kernelStream (like CUDA graph capture pattern)
     rppStreamBeginCapture(ctx.kernelStream, RPP_STREAM_CAPTURE_MODE_GLOBAL);
     RPPmodule cuMod;
-    rppModuleLoad(&ctx.rppBinMod, "rpp_kernel/matmul_q80_vxm.o");
+    rpp_module_load_once(ctx.rppBinMod, "rpp_kernel/matmul_q80_vxm.o");
     // -------------------------
     // SRAM allocation planning
     // -------------------------
@@ -199,8 +199,9 @@ static void rpp_matmul_q80_vxm(rpp_kernel_context & ctx,
     }
 
     rppStreamEndCapture(ctx.kernelStream, &ctx.graph);
-    if (is_instantial) {
-        rppGraphInstantiate(&ctx.graphexec, ctx.graph, NULL, NULL, 0);
+    const std::string graph_key = rpp_join_function_name_and_args(__func__, M, K, N, weights_group, in_bytes_per_element, out_bytes_per_element);
+    if (rpp_graph_instantiate(ctx.graphexec, ctx.graph, graph_key.c_str(), is_instantial) != RPP_SUCCESS) {
+        throw std::runtime_error("rpp_graph_instantiate failed.");
     }
 }
 
@@ -227,7 +228,7 @@ static void rpp_matmul_q80_vxm_pipeline(rpp_kernel_context & ctx,
 
     rppStreamBeginCapture(ctx.kernelStream, RPP_STREAM_CAPTURE_MODE_GLOBAL);
     RPPmodule cuMod;
-    rppModuleLoad(&ctx.rppBinMod, "rpp_kernel/matmul_q80_vxm.o");
+    rpp_module_load_once(ctx.rppBinMod, "rpp_kernel/matmul_q80_vxm.o");
 
     int nr_of_tiles, groups_per_tile;
     get_tiles_info(N, K, weights_group, nr_of_tiles, groups_per_tile);
@@ -362,8 +363,9 @@ static void rpp_matmul_q80_vxm_pipeline(rpp_kernel_context & ctx,
     }
 
     rppStreamEndCapture(ctx.kernelStream, &ctx.graph);
-    if (is_instantial) {
-        rppGraphInstantiate(&ctx.graphexec, ctx.graph, NULL, NULL, 0);
+    const std::string graph_key = rpp_join_function_name_and_args(__func__, M, K, N, weights_group, in_bytes_per_element, out_bytes_per_element);
+    if (rpp_graph_instantiate(ctx.graphexec, ctx.graph, graph_key.c_str(), is_instantial) != RPP_SUCCESS) {
+        throw std::runtime_error("rpp_graph_instantiate failed.");
     }
 }
 
@@ -376,11 +378,10 @@ static void rpp_matmul_q80_vxm_build(rpp_kernel_context & ctx,
                                      int                  out_bytes_per_element,
                                      int                  use_pipeline  = 0,
                                      int                  is_instantial = 1) {
-    // if (use_pipeline) {
-    //     rpp_matmul_q80_vxm_pipeline(ctx, M, K, N, weights_group, in_bytes_per_element, out_bytes_per_element, is_instantial);
-    // } else {
-    //     rpp_matmul_q80_vxm(ctx, M, K, N, weights_group, in_bytes_per_element, out_bytes_per_element, is_instantial);
-    // }
-    rpp_matmul_q80_vxm(ctx, M, K, N, weights_group, in_bytes_per_element, out_bytes_per_element, is_instantial);
+    if (use_pipeline) {
+        rpp_matmul_q80_vxm_pipeline(ctx, M, K, N, weights_group, in_bytes_per_element, out_bytes_per_element, is_instantial);
+    } else {
+        rpp_matmul_q80_vxm(ctx, M, K, N, weights_group, in_bytes_per_element, out_bytes_per_element, is_instantial);
+    }
 }
 }  // namespace kernel_q8_0_vxm

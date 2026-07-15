@@ -25,13 +25,6 @@ struct rpp_kernel_mul_mat_id : public rpp_node_kernel {
         }
     }
 
-    // all rms_norm kernel will shared the same workspace,
-    void init_workspace(ggml_backend_rpp_context & ctx) {
-        this->kernel_ctx->dev_workspace = (RPPdeviceptr) (ctx.pool().alloc(64 * 1024));
-    }
-
-    void init_workspace(RPPdeviceptr dev_workspace) { this->kernel_ctx->dev_workspace = dev_workspace; }
-
     void * sram_io{ nullptr };
 
     bool rpp_dispatch_func(ggml_backend_rpp_context & ctx,

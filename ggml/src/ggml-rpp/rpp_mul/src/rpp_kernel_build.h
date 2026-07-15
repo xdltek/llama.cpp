@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <cstring>
 #include <iostream>
+#include <mutex>
 #include <vector>
 
 inline void get_tile_info(int C, int H, int W, int & num_of_tiles, int & elements_per_tile) {
@@ -29,11 +30,63 @@ inline int rpp_elementwise_round_up_to_32(int a) {
     return (a + 31) / 32 * 32;
 }
 
+inline RPPdeviceptr rpp_elementwise_prepare_reciprocal_lut_workspace(rpp_kernel_context & ctx) {
+    constexpr int reciprocal_table_elements = 65536;
+    constexpr int reciprocal_table_bytes    = reciprocal_table_elements * (int) sizeof(uint16_t);
+    static std::mutex   mutex;
+    static RPPdeviceptr kernel_lut_workspace = 0;
+
+    std::lock_guard<std::mutex> lock(mutex);
+    if (kernel_lut_workspace == 0) {
+        rtMalloc((void **) &kernel_lut_workspace, reciprocal_table_bytes);
+
+        std::vector<uint16_t> reciprocal_table(reciprocal_table_elements);
+        for (uint32_t i = 0; i < (uint32_t) reciprocal_table_elements; ++i) {
+            uint32_t x = i;
+            x <<= 16;
+            float y             = 1.0f / *(float *) &x;
+            reciprocal_table[i] = rpp::bfloat16::round_to_bfloat16(y).value;
+        }
+        reciprocal_table[0]      = 0;
+        reciprocal_table[0x8000] = 0;
+        rtMemcpy((void *) kernel_lut_workspace, reciprocal_table.data(), reciprocal_table_bytes, rtMemcpyHostToDevice);
+    }
+
+    RPPdeviceptr dev_lut_workspace = ctx.dev_workspace;
+    if (dev_lut_workspace == 0) {
+        ctx.dev_workspace = kernel_lut_workspace;
+        return kernel_lut_workspace;
+    }
+    if (dev_lut_workspace != kernel_lut_workspace) {
+        rtMemcpy((void *) dev_lut_workspace, (const void *) kernel_lut_workspace, reciprocal_table_bytes,
+                 rtMemcpyDeviceToDevice);
+    }
+    return dev_lut_workspace;
+}
+
+inline bool rpp_elementwise_input1_is_row_broadcast(int axis) {
+    return axis == 1 || axis == 6 || axis == 7 || axis == 8;
+}
+
+inline bool rpp_elementwise_input1_is_scalar_broadcast(int axis) {
+    return axis == 8;
+}
+
+inline bool rpp_elementwise_input1_is_materialized_row_broadcast(int axis) {
+    return axis == 1 || axis == 6 || axis == 7;
+}
+
 inline int rpp_elementwise_get_input1_bytes(int axis, int H, int W, int in1_bytes_per_element) {
     if (axis == -1 || axis == 0) {
         return H * W * in1_bytes_per_element;
     }
-    if (axis == 1 || axis == 6 || axis == 7) {
+    if (rpp_elementwise_input1_is_scalar_broadcast(axis)) {
+        return H * W * in1_bytes_per_element;
+    }
+    if (rpp_elementwise_input1_is_materialized_row_broadcast(axis)) {
+        return H * W * in1_bytes_per_element;
+    }
+    if (rpp_elementwise_input1_is_row_broadcast(axis)) {
         return W * in1_bytes_per_element;
     }
     if (axis == 2) {
@@ -117,6 +170,358 @@ inline int rpp_elementwise_get_max_tile_rows(int H,
     return lo;
 }
 
+inline int rpp_elementwise_get_mul_bc_input1_bytes(int axis, int W, int in1_bytes_per_element) {
+    return rpp_elementwise_input1_is_scalar_broadcast(axis) ? in1_bytes_per_element : W * in1_bytes_per_element;
+}
+
+inline int rpp_elementwise_get_mul_bc_tile_sram_bytes(int tile_H,
+                                                      int W,
+                                                      int axis,
+                                                      int in0_bytes_per_element,
+                                                      int in1_bytes_per_element,
+                                                      int out_bytes_per_element) {
+    const int  padded_W             = rpp_elementwise_round_up_to_32(W);
+    const bool use_row_tail_padding = padded_W != W;
+    const int  input1_bytes         = rpp_elementwise_get_mul_bc_input1_bytes(axis, W, in1_bytes_per_element);
+
+    if (use_row_tail_padding) {
+        const int row_bytes_bf16 = padded_W * (int) sizeof(uint16_t);
+        int       total          = 0;
+        if (in0_bytes_per_element == (int) sizeof(float)) {
+            total += rpp_elementwise_round_up(tile_H * W * (int) sizeof(float));
+        }
+        if (in1_bytes_per_element == (int) sizeof(float)) {
+            total += rpp_elementwise_round_up(input1_bytes);
+        }
+        total += rpp_elementwise_round_up(tile_H * row_bytes_bf16);
+        total += rpp_elementwise_round_up(rpp_elementwise_input1_is_scalar_broadcast(axis) ?
+                                              (int) sizeof(uint16_t) :
+                                              row_bytes_bf16);
+        total += rpp_elementwise_round_up(tile_H * row_bytes_bf16);
+        if (out_bytes_per_element == (int) sizeof(float) && in0_bytes_per_element != (int) sizeof(float) &&
+            in1_bytes_per_element != (int) sizeof(float)) {
+            total += rpp_elementwise_round_up(tile_H * W * (int) sizeof(float));
+        }
+        return total;
+    }
+
+    const int sizeA = tile_H * W * in0_bytes_per_element;
+    const int sizeB = input1_bytes;
+    const int sizeC = tile_H * W * out_bytes_per_element;
+    return rpp_elementwise_round_up(sizeA) + rpp_elementwise_round_up(sizeB) + rpp_elementwise_round_up(sizeC);
+}
+
+inline int rpp_elementwise_get_mul_bc_max_tile_rows(int H,
+                                                    int W,
+                                                    int axis,
+                                                    int in0_bytes_per_element,
+                                                    int in1_bytes_per_element,
+                                                    int out_bytes_per_element,
+                                                    int sram_limit) {
+    int lo = 0;
+    int hi = H;
+    while (lo < hi) {
+        const int mid = (lo + hi + 1) / 2;
+        const int total_sram_bytes =
+            rpp_elementwise_get_mul_bc_tile_sram_bytes(mid, W, axis, in0_bytes_per_element, in1_bytes_per_element,
+                                                       out_bytes_per_element);
+        if (total_sram_bytes <= sram_limit) {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    if (lo <= 0) {
+        std::cerr << "SRAM overflow: even one MUL broadcast row does not fit in SRAM\n";
+        std::abort();
+    }
+    return lo;
+}
+
+inline void rpp_elementwise_build_mul_broadcast(rpp_kernel_context & ctx,
+                                                int                  C,
+                                                int                  H,
+                                                int                  W,
+                                                int                  axis,
+                                                int                  in0_bytes_per_element,
+                                                int                  in1_bytes_per_element,
+                                                int                  out_bytes_per_element,
+                                                int                  is_instantial = 1) {
+    dim3                  threadsPerBlock;
+    dim3                  blocksPerGrid;
+    std::vector<uint32_t> params;
+    RPPdeviceptr          devA;
+    RPPdeviceptr          devB;
+
+    if (axis <= 2 || axis == 6 || axis == 8) {
+        devA = ctx.dev_in[0];
+        devB = ctx.dev_in[1];
+    } else {
+        devA                  = ctx.dev_in[1];
+        devB                  = ctx.dev_in[0];
+        int tmp               = in1_bytes_per_element;
+        in1_bytes_per_element = in0_bytes_per_element;
+        in0_bytes_per_element = tmp;
+        if (axis != 7) {
+            axis = axis - 3;
+        }
+    }
+
+    const bool scalar_broadcast = rpp_elementwise_input1_is_scalar_broadcast(axis);
+    const bool row_broadcast    = rpp_elementwise_input1_is_materialized_row_broadcast(axis);
+    if (!scalar_broadcast && !row_broadcast) {
+        throw std::runtime_error("Unsupported MUL broadcast axis");
+    }
+
+    RPPdeviceptr devC = ctx.dev_out[0];
+
+    rppStreamBeginCapture(ctx.kernelStream, RPP_STREAM_CAPTURE_MODE_GLOBAL);
+    rpp_module_load_once(ctx.rppBinMod, "rpp_kernel/elementwise.o");
+
+    RPPdeviceptr sram_base            = ctx.virtual_sram_base;
+    const int    padded_W             = rpp_elementwise_round_up_to_32(W);
+    const bool   use_row_tail_padding = padded_W != W;
+    const int    SRAM_LIMIT           = 22 * 1024 * 1024;
+    const int    max_tile_h           = rpp_elementwise_get_mul_bc_max_tile_rows(
+        H, W, axis, in0_bytes_per_element, in1_bytes_per_element, out_bytes_per_element, SRAM_LIMIT);
+
+    for (int c = 0; c < C; ++c) {
+        const size_t devA_offset_base = (size_t) c * (size_t) H * (size_t) W * (size_t) in0_bytes_per_element;
+        size_t       devB_offset_base = 0;
+        if (axis == 1) {
+            devB_offset_base = (size_t) c * (size_t) W * (size_t) in1_bytes_per_element;
+        }
+        const size_t devC_offset_base = (size_t) c * (size_t) H * (size_t) W * (size_t) out_bytes_per_element;
+
+        for (int h_begin = 0; h_begin < H; h_begin += max_tile_h) {
+            const int    tile_H       = std::min(max_tile_h, H - h_begin);
+            const int    sizeA        = tile_H * W * in0_bytes_per_element;
+            const int    sizeB        = rpp_elementwise_get_mul_bc_input1_bytes(axis, W, in1_bytes_per_element);
+            const int    sizeC        = tile_H * W * out_bytes_per_element;
+            const size_t devA_offset  = devA_offset_base + (size_t) h_begin * (size_t) W * in0_bytes_per_element;
+            const size_t devB_offset  = devB_offset_base;
+            const size_t devC_offset  = devC_offset_base + (size_t) h_begin * (size_t) W * out_bytes_per_element;
+
+            if (use_row_tail_padding) {
+                assert(padded_W < 8192);
+                const int row_bytes_bf16 = padded_W * (int) sizeof(uint16_t);
+                int       sram_cursor    = 0;
+
+                RPPdeviceptr sramACompact = 0;
+                if (in0_bytes_per_element == (int) sizeof(float)) {
+                    sramACompact = sram_base + sram_cursor;
+                    sram_cursor += rpp_elementwise_round_up(sizeA);
+                }
+
+                RPPdeviceptr sramBCompact = 0;
+                if (in1_bytes_per_element == (int) sizeof(float)) {
+                    sramBCompact = sram_base + sram_cursor;
+                    sram_cursor += rpp_elementwise_round_up(sizeB);
+                }
+
+                RPPdeviceptr sramAPadded = sram_base + sram_cursor;
+                sram_cursor += rpp_elementwise_round_up(tile_H * row_bytes_bf16);
+                RPPdeviceptr sramBPadded = sram_base + sram_cursor;
+                sram_cursor += rpp_elementwise_round_up(scalar_broadcast ? (int) sizeof(uint16_t) : row_bytes_bf16);
+                RPPdeviceptr sramOutPadded = sram_base + sram_cursor;
+                sram_cursor += rpp_elementwise_round_up(tile_H * row_bytes_bf16);
+
+                RPPdeviceptr sramOutCompact = 0;
+                if (out_bytes_per_element == (int) sizeof(float)) {
+                    if (sramACompact != 0) {
+                        sramOutCompact = sramACompact;
+                    } else if (sramBCompact != 0) {
+                        sramOutCompact = sramBCompact;
+                    } else {
+                        sramOutCompact = sram_base + sram_cursor;
+                        sram_cursor += rpp_elementwise_round_up(sizeC);
+                    }
+                }
+                assert(sram_cursor <= SRAM_LIMIT);
+
+                auto copy_rows_from_dev = [&](RPPdeviceptr sramDst, RPPdeviceptr devSrc, int rows, int elem_bytes) {
+                    for (int h = 0; h < rows; ++h) {
+                        rtMemcpyAsync((void *) (sramDst + (RPPdeviceptr) h * row_bytes_bf16),
+                                      (const void *) (devSrc + (RPPdeviceptr) h * W * elem_bytes), W * elem_bytes,
+                                      rtMemcpyDeviceToSram, ctx.kernelStream);
+                    }
+                };
+                auto convert_rows_f32_to_bf16 = [&](RPPdeviceptr sramSrcCompact, RPPdeviceptr sramDstPadded, int rows) {
+                    for (int h = 0; h < rows; ++h) {
+                        calc_tbdim_flattern(1, W, threadsPerBlock, blocksPerGrid);
+                        params.clear();
+                        cvt_kernel_param_init(
+                            threadsPerBlock, (uint32_t) (sramSrcCompact + (RPPdeviceptr) h * W * (int) sizeof(float)),
+                            (uint32_t) (sramDstPadded + (RPPdeviceptr) h * row_bytes_bf16), kFLOAT, kBF16, params);
+                        launchWrapperAysnc("opt_vector_cvt_32_16", blocksPerGrid, threadsPerBlock, params,
+                                           ctx.rppBinMod, ctx.kernelStream);
+                    }
+                };
+
+                if (in0_bytes_per_element == (int) sizeof(float)) {
+                    rtMemcpyAsync((void *) sramACompact, (const void *) (devA + (RPPdeviceptr) devA_offset), sizeA,
+                                  rtMemcpyDeviceToSram, ctx.kernelStream);
+                    convert_rows_f32_to_bf16(sramACompact, sramAPadded, tile_H);
+                } else {
+                    copy_rows_from_dev(sramAPadded, devA + (RPPdeviceptr) devA_offset, tile_H, (int) sizeof(uint16_t));
+                }
+
+                if (in1_bytes_per_element == (int) sizeof(float)) {
+                    rtMemcpyAsync((void *) sramBCompact, (const void *) (devB + (RPPdeviceptr) devB_offset), sizeB,
+                                  rtMemcpyDeviceToSram, ctx.kernelStream);
+                    if (scalar_broadcast) {
+                        calc_tbdim_flattern(1, 1, threadsPerBlock, blocksPerGrid);
+                        params.clear();
+                        cvt_kernel_param_init(threadsPerBlock, (uint32_t) sramBCompact, (uint32_t) sramBPadded, kFLOAT,
+                                              kBF16, params);
+                        launchWrapperAysnc("opt_vector_cvt_32_16", blocksPerGrid, threadsPerBlock, params,
+                                           ctx.rppBinMod, ctx.kernelStream);
+                    } else {
+                        convert_rows_f32_to_bf16(sramBCompact, sramBPadded, 1);
+                    }
+                } else {
+                    rtMemcpyAsync((void *) sramBPadded, (const void *) (devB + (RPPdeviceptr) devB_offset), sizeB,
+                                  rtMemcpyDeviceToSram, ctx.kernelStream);
+                }
+
+                threadsPerBlock.x = padded_W;
+                threadsPerBlock.y = 1;
+                threadsPerBlock.z = 1;
+                blocksPerGrid.x   = 1;
+                blocksPerGrid.y   = 1;
+                blocksPerGrid.z   = 1;
+                while (threadsPerBlock.x * threadsPerBlock.y * threadsPerBlock.z <= 32) {
+                    threadsPerBlock.y++;
+                }
+
+                params.clear();
+                params.emplace_back((uint32_t) sramAPadded);
+                params.emplace_back((uint32_t) sramBPadded);
+                params.emplace_back((uint32_t) sramOutPadded);
+                params.emplace_back(row_bytes_bf16);
+                if (scalar_broadcast) {
+                    params.emplace_back(1);
+                    blocksPerGrid.z = tile_H;
+                    launchWrapperAysnc("opt_binary_uniform_f16", blocksPerGrid, threadsPerBlock, params,
+                                       ctx.rppBinMod, ctx.kernelStream);
+                } else {
+                    params.emplace_back(0);
+                    params.emplace_back(padded_W);
+                    params.emplace_back(1);
+                    blocksPerGrid.z = tile_H;
+                    launchWrapperAysnc("opt_binary_bc_y_f16", blocksPerGrid, threadsPerBlock, params, ctx.rppBinMod,
+                                       ctx.kernelStream);
+                }
+
+                if (out_bytes_per_element == (int) sizeof(float)) {
+                    for (int h = 0; h < tile_H; ++h) {
+                        calc_tbdim_flattern(1, W * 2, threadsPerBlock, blocksPerGrid);
+                        params.clear();
+                        cvt_kernel_param_init_opt(
+                            threadsPerBlock, (uint32_t) (sramOutPadded + (RPPdeviceptr) h * row_bytes_bf16),
+                            (uint32_t) (sramOutCompact + (RPPdeviceptr) h * W * (int) sizeof(float)), kBF16, kFLOAT,
+                            params);
+                        launchWrapperAysnc("opt_vector_cvt_f16_f32_opt", blocksPerGrid, threadsPerBlock, params,
+                                           ctx.rppBinMod, ctx.kernelStream);
+                    }
+                    rtMemcpyAsync((void *) (devC + (RPPdeviceptr) devC_offset), (const void *) sramOutCompact, sizeC,
+                                  rtMemcpySramToDevice, ctx.kernelStream);
+                } else {
+                    for (int h = 0; h < tile_H; ++h) {
+                        rtMemcpyAsync((void *) (devC + (RPPdeviceptr) devC_offset +
+                                                (RPPdeviceptr) h * W * (int) sizeof(uint16_t)),
+                                      (const void *) (sramOutPadded + (RPPdeviceptr) h * row_bytes_bf16),
+                                      W * (int) sizeof(uint16_t), rtMemcpySramToDevice, ctx.kernelStream);
+                    }
+                }
+
+                continue;
+            }
+
+            RPPdeviceptr sramA = sram_base;
+            RPPdeviceptr sramB = sramA + rpp_elementwise_round_up(sizeA);
+            RPPdeviceptr sramC = sramB + rpp_elementwise_round_up(sizeB);
+            assert((int) (sramC + rpp_elementwise_round_up(sizeC) - sram_base) <= SRAM_LIMIT);
+
+            rtMemcpyAsync((void *) sramA, (const void *) (devA + (RPPdeviceptr) devA_offset), sizeA,
+                          rtMemcpyDeviceToSram, ctx.kernelStream);
+            if (in0_bytes_per_element == (int) sizeof(float)) {
+                calc_tbdim_flattern(tile_H, W, threadsPerBlock, blocksPerGrid);
+                params.clear();
+                cvt_kernel_param_init(threadsPerBlock, (uint32_t) sramA, (uint32_t) sramA, kFLOAT, kBF16, params);
+                launchWrapperAysnc("opt_vector_cvt_32_16", blocksPerGrid, threadsPerBlock, params, ctx.rppBinMod,
+                                   ctx.kernelStream);
+            }
+
+            rtMemcpyAsync((void *) sramB, (const void *) (devB + (RPPdeviceptr) devB_offset), sizeB,
+                          rtMemcpyDeviceToSram, ctx.kernelStream);
+            if (in1_bytes_per_element == (int) sizeof(float)) {
+                calc_tbdim_flattern(1, scalar_broadcast ? 1 : W, threadsPerBlock, blocksPerGrid);
+                params.clear();
+                cvt_kernel_param_init(threadsPerBlock, (uint32_t) sramB, (uint32_t) sramB, kFLOAT, kBF16, params);
+                launchWrapperAysnc("opt_vector_cvt_32_16", blocksPerGrid, threadsPerBlock, params, ctx.rppBinMod,
+                                   ctx.kernelStream);
+            }
+
+            if (W < 8192) {
+                threadsPerBlock.x = W;
+                threadsPerBlock.y = 1;
+                threadsPerBlock.z = 1;
+                blocksPerGrid.x   = 1;
+                blocksPerGrid.y   = 1;
+                blocksPerGrid.z   = tile_H;
+            } else {
+                throw std::runtime_error("Elementwise Width is Too Big");
+            }
+            while (threadsPerBlock.x * threadsPerBlock.y * threadsPerBlock.z <= 32) {
+                threadsPerBlock.y++;
+            }
+
+            const uint32_t offset0 = W * sizeof(uint16_t);
+            const uint32_t out_addr =
+                out_bytes_per_element == (int) sizeof(float) ? (uint32_t) sramA : (uint32_t) sramC;
+
+            params.clear();
+            params.emplace_back((uint32_t) sramA);
+            params.emplace_back((uint32_t) sramB);
+            params.emplace_back(out_addr);
+            params.emplace_back(offset0);
+            if (scalar_broadcast) {
+                params.emplace_back(1);
+                launchWrapperAysnc("opt_binary_uniform_f16", blocksPerGrid, threadsPerBlock, params, ctx.rppBinMod,
+                                   ctx.kernelStream);
+            } else {
+                params.emplace_back(0);
+                params.emplace_back(W);
+                params.emplace_back(1);
+                launchWrapperAysnc("opt_binary_bc_y_f16", blocksPerGrid, threadsPerBlock, params, ctx.rppBinMod,
+                                   ctx.kernelStream);
+            }
+
+            if (out_bytes_per_element == (int) sizeof(float)) {
+                params.clear();
+                calc_tbdim_flattern(tile_H, W * 2, threadsPerBlock, blocksPerGrid);
+                cvt_kernel_param_init_opt(threadsPerBlock, (uint32_t) sramA, (uint32_t) sramC, kBF16, kFLOAT, params);
+                launchWrapperAysnc("opt_vector_cvt_f16_f32_opt", blocksPerGrid, threadsPerBlock, params,
+                                   ctx.rppBinMod, ctx.kernelStream);
+                rtMemcpyAsync((void *) (devC + (RPPdeviceptr) devC_offset), (const void *) sramC, sizeC,
+                              rtMemcpySramToDevice, ctx.kernelStream);
+            } else {
+                rtMemcpyAsync((void *) (devC + (RPPdeviceptr) devC_offset), (const void *) sramC, sizeC,
+                              rtMemcpySramToDevice, ctx.kernelStream);
+            }
+        }
+    }
+
+    rppStreamEndCapture(ctx.kernelStream, &ctx.graph);
+    const std::string graph_key =
+        rpp_join_function_name_and_args(__func__, "mul_bc_v1", C, H, W, axis, in0_bytes_per_element,
+                                        in1_bytes_per_element, out_bytes_per_element);
+    if (rpp_graph_instantiate(ctx.graphexec, ctx.graph, graph_key.c_str(), is_instantial) != RPP_SUCCESS) {
+        throw std::runtime_error("rpp_graph_instantiate failed.");
+    }
+}
+
 inline void rpp_elementwise_build_tiled(rpp_kernel_context & ctx,
                                         rppElementWiseType   type,
                                         int                  C,
@@ -134,7 +539,7 @@ inline void rpp_elementwise_build_tiled(rpp_kernel_context & ctx,
     RPPdeviceptr          devB;
     bool                  ab_switched = false;
 
-    if (axis <= 2 || axis == 6) {
+    if (axis <= 2 || axis == 6 || axis == 8) {
         devA = ctx.dev_in[0];
         devB = ctx.dev_in[1];
     } else {
@@ -151,24 +556,15 @@ inline void rpp_elementwise_build_tiled(rpp_kernel_context & ctx,
 
     RPPdeviceptr devC = ctx.dev_out[0];
 
-    void * reciprocal_table       = nullptr;
-    int    reciprocal_table_bytes = 0;
+    RPPdeviceptr dev_reciprocal_lut    = 0;
+    int          reciprocal_table_bytes = 0;
     if (type == RPP_ELEMWISE_DIV) {
         reciprocal_table_bytes = 65536 * (int) sizeof(uint16_t);
-        reciprocal_table       = malloc(reciprocal_table_bytes);
-        for (uint32_t i = 0; i < 65536; ++i) {
-            uint32_t x = i;
-            x <<= 16;
-            float y                            = 1.0f / *(float *) &x;
-            ((uint16_t *) reciprocal_table)[i] = rpp::bfloat16::round_to_bfloat16(y).value;
-        }
-        ((uint16_t *) reciprocal_table)[0]      = 0;
-        ((uint16_t *) reciprocal_table)[0x8000] = 0;
-        rtMemcpy((void *) ctx.dev_workspace, reciprocal_table, reciprocal_table_bytes, rtMemcpyHostToDevice);
+        dev_reciprocal_lut     = rpp_elementwise_prepare_reciprocal_lut_workspace(ctx);
     }
 
     rppStreamBeginCapture(ctx.kernelStream, RPP_STREAM_CAPTURE_MODE_GLOBAL);
-    rppModuleLoad(&ctx.rppBinMod, "rpp_kernel/elementwise.o");
+    rpp_module_load_once(ctx.rppBinMod, "rpp_kernel/elementwise.o");
 
     RPPdeviceptr sram_base            = ctx.virtual_sram_base;
     RPPdeviceptr sramReciprocalTable  = sram_base;
@@ -179,7 +575,7 @@ inline void rpp_elementwise_build_tiled(rpp_kernel_context & ctx,
                                                              out_bytes_per_element, reciprocal_table_bytes, SRAM_LIMIT);
 
     if (type == RPP_ELEMWISE_DIV) {
-        rtMemcpyAsync((void *) sramReciprocalTable, (const void *) ctx.dev_workspace, reciprocal_table_bytes,
+        rtMemcpyAsync((void *) sramReciprocalTable, (const void *) dev_reciprocal_lut, reciprocal_table_bytes,
                       rtMemcpyDeviceToSram, ctx.kernelStream);
     }
 
@@ -228,7 +624,11 @@ inline void rpp_elementwise_build_tiled(rpp_kernel_context & ctx,
                 const int sizeA_compact  = sizeA;
                 const int sizeB_compact  = sizeB;
                 const int sizeA_padded   = tile_H * row_bytes_bf16;
-                const int sizeB_padded   = (axis == -1 || axis == 0) ? tile_H * row_bytes_bf16 : row_bytes_bf16;
+                const int sizeB_padded   = (axis == -1 || axis == 0 ||
+                                            rpp_elementwise_input1_is_materialized_row_broadcast(axis) ||
+                                            rpp_elementwise_input1_is_scalar_broadcast(axis)) ?
+                                               tile_H * row_bytes_bf16 :
+                                               row_bytes_bf16;
                 const int sizeOut_padded = tile_H * row_bytes_bf16;
 
                 RPPdeviceptr sramCursor   = sramReciprocalTable + reciprocal_table_bytes;
@@ -276,7 +676,21 @@ inline void rpp_elementwise_build_tiled(rpp_kernel_context & ctx,
                                       rtMemcpyDeviceToSram, ctx.kernelStream);
                     }
                 };
-
+                auto copy_scalar_from_dev_as_row = [&](RPPdeviceptr sramDst, RPPdeviceptr devSrc, int elem_bytes) {
+                    for (int h = 0; h < tile_H; ++h) {
+                        for (int w = 0; w < W; ++w) {
+                            rtMemcpyAsync((void *) (sramDst + ((RPPdeviceptr) h * W + w) * elem_bytes),
+                                          (const void *) devSrc, elem_bytes, rtMemcpyDeviceToSram, ctx.kernelStream);
+                        }
+                    }
+                };
+                auto copy_same_row_from_dev = [&](RPPdeviceptr sramDst, RPPdeviceptr devSrc, int row_bytes_dst,
+                                                  int elem_bytes) {
+                    for (int h = 0; h < tile_H; ++h) {
+                        rtMemcpyAsync((void *) (sramDst + (RPPdeviceptr) h * row_bytes_dst), (const void *) devSrc,
+                                      W * elem_bytes, rtMemcpyDeviceToSram, ctx.kernelStream);
+                    }
+                };
                 auto convert_rows_f32_to_bf16 = [&](RPPdeviceptr sramSrcCompact, RPPdeviceptr sramDstPadded, int rows) {
                     for (int h = 0; h < rows; ++h) {
                         calc_tbdim_flattern(1, W, threadsPerBlock, blocksPerGrid);
@@ -298,9 +712,18 @@ inline void rpp_elementwise_build_tiled(rpp_kernel_context & ctx,
                 }
 
                 if (in1_bytes_per_element == (int) sizeof(float)) {
-                    rtMemcpyAsync((void *) sramBCompact, (const void *) (devB + (RPPdeviceptr) devB_offset),
-                                  sizeB_compact, rtMemcpyDeviceToSram, ctx.kernelStream);
-                    if (axis == -1 || axis == 0) {
+                    if (axis == 8) {
+                        copy_scalar_from_dev_as_row(sramBCompact, devB + (RPPdeviceptr) devB_offset,
+                                                    in1_bytes_per_element);
+                    } else if (rpp_elementwise_input1_is_materialized_row_broadcast(axis)) {
+                        copy_same_row_from_dev(sramBCompact, devB + (RPPdeviceptr) devB_offset,
+                                               W * in1_bytes_per_element, in1_bytes_per_element);
+                    } else {
+                        rtMemcpyAsync((void *) sramBCompact, (const void *) (devB + (RPPdeviceptr) devB_offset),
+                                      sizeB_compact, rtMemcpyDeviceToSram, ctx.kernelStream);
+                    }
+                    if (axis == -1 || axis == 0 || rpp_elementwise_input1_is_materialized_row_broadcast(axis) ||
+                        rpp_elementwise_input1_is_scalar_broadcast(axis)) {
                         convert_rows_f32_to_bf16(sramBCompact, sramBPadded, tile_H);
                     } else {
                         calc_tbdim_flattern(1, W, threadsPerBlock, blocksPerGrid);
@@ -313,6 +736,12 @@ inline void rpp_elementwise_build_tiled(rpp_kernel_context & ctx,
                 } else {
                     if (axis == -1 || axis == 0) {
                         copy_rows_from_dev(sramBPadded, devB + (RPPdeviceptr) devB_offset, (int) sizeof(uint16_t));
+                    } else if (axis == 8) {
+                        copy_scalar_from_dev_as_row(sramBPadded, devB + (RPPdeviceptr) devB_offset,
+                                                    in1_bytes_per_element);
+                    } else if (rpp_elementwise_input1_is_materialized_row_broadcast(axis)) {
+                        copy_same_row_from_dev(sramBPadded, devB + (RPPdeviceptr) devB_offset, row_bytes_bf16,
+                                               in1_bytes_per_element);
                     } else {
                         rtMemcpyAsync((void *) sramBPadded, (const void *) (devB + (RPPdeviceptr) devB_offset),
                                       W * (int) sizeof(uint16_t), rtMemcpyDeviceToSram, ctx.kernelStream);
@@ -350,10 +779,10 @@ inline void rpp_elementwise_build_tiled(rpp_kernel_context & ctx,
                 params.emplace_back((uint32_t) sramBPadded);
                 params.emplace_back((uint32_t) sramOutPadded);
                 params.emplace_back(row_bytes_bf16);
-                params.emplace_back((axis == 1 || axis == 6 || axis == 7) ? 0 : row_bytes_bf16);
+                params.emplace_back(row_bytes_bf16);
                 params.emplace_back(tile_H);
                 params.emplace_back(padded_W);
-                params.emplace_back((axis == 1 || axis == 6 || axis == 7) ? 0 : padded_W);
+                params.emplace_back(padded_W);
                 if (type == RPP_ELEMWISE_ADD) {
                     launchWrapperAysnc("elementwise_add", blocksPerGrid, threadsPerBlock, params, ctx.rppBinMod,
                                        ctx.kernelStream);
@@ -399,12 +828,29 @@ inline void rpp_elementwise_build_tiled(rpp_kernel_context & ctx,
                                    ctx.kernelStream);
             }
 
-            rtMemcpyAsync((void *) sramB, (const void *) (devB + (RPPdeviceptr) devB_offset), sizeB,
-                          rtMemcpyDeviceToSram, ctx.kernelStream);
+            if (axis == 8) {
+                for (int h = 0; h < tile_H; ++h) {
+                    for (int w = 0; w < W; ++w) {
+                        rtMemcpyAsync((void *) (sramB + ((RPPdeviceptr) h * W + w) * in1_bytes_per_element),
+                                      (const void *) (devB + (RPPdeviceptr) devB_offset), in1_bytes_per_element,
+                                      rtMemcpyDeviceToSram, ctx.kernelStream);
+                    }
+                }
+            } else if (rpp_elementwise_input1_is_materialized_row_broadcast(axis)) {
+                for (int h = 0; h < tile_H; ++h) {
+                    rtMemcpyAsync((void *) (sramB + (RPPdeviceptr) h * W * in1_bytes_per_element),
+                                  (const void *) (devB + (RPPdeviceptr) devB_offset),
+                                  W * in1_bytes_per_element, rtMemcpyDeviceToSram, ctx.kernelStream);
+                }
+            } else {
+                rtMemcpyAsync((void *) sramB, (const void *) (devB + (RPPdeviceptr) devB_offset), sizeB,
+                              rtMemcpyDeviceToSram, ctx.kernelStream);
+            }
             if (in1_bytes_per_element == (int) sizeof(float)) {
-                if (axis == -1 || axis == 0) {
+                if (axis == -1 || axis == 0 || rpp_elementwise_input1_is_materialized_row_broadcast(axis) ||
+                    rpp_elementwise_input1_is_scalar_broadcast(axis)) {
                     calc_tbdim_flattern(tile_H, W, threadsPerBlock, blocksPerGrid);
-                } else if (axis == 1 || axis == 6 || axis == 7) {
+                } else if (rpp_elementwise_input1_is_row_broadcast(axis)) {
                     calc_tbdim_flattern(1, W, threadsPerBlock, blocksPerGrid);
                 } else if (axis == 2) {
                     calc_tbdim_flattern(1, tile_H, threadsPerBlock, blocksPerGrid);
@@ -430,7 +876,7 @@ inline void rpp_elementwise_build_tiled(rpp_kernel_context & ctx,
                 } else {
                     if (axis == -1 || axis == 0) {
                         calc_tbdim_flattern(tile_H, W, threadsPerBlock, blocksPerGrid);
-                    } else if (axis == 1 || axis == 6 || axis == 7) {
+                    } else if (rpp_elementwise_input1_is_row_broadcast(axis)) {
                         calc_tbdim_flattern(1, W, threadsPerBlock, blocksPerGrid);
                     } else if (axis == 2) {
                         calc_tbdim_flattern(1, tile_H, threadsPerBlock, blocksPerGrid);
@@ -479,10 +925,6 @@ inline void rpp_elementwise_build_tiled(rpp_kernel_context & ctx,
             uint32_t offset1  = threadsPerBlock.x * threadsPerBlock.z * sizeof(uint16_t);
             uint32_t stridez1 = threadsPerBlock.x;
             blocksPerGrid.z   = 1;
-            if (axis == 1 || axis == 6 || axis == 7) {
-                offset1  = 0;
-                stridez1 = 0;
-            }
 
             params.clear();
             if (axis == 2) {
@@ -528,7 +970,7 @@ inline void rpp_elementwise_build_tiled(rpp_kernel_context & ctx,
 
             if (out_bytes_per_element == (int) sizeof(float)) {
                 params.clear();
-                calc_tbdim_flattern(tile_H * 2, W, threadsPerBlock, blocksPerGrid);
+                calc_tbdim_flattern(tile_H, W * 2, threadsPerBlock, blocksPerGrid);
                 cvt_kernel_param_init_opt(threadsPerBlock, (uint32_t) sramA, (uint32_t) sramC, kBF16, kFLOAT, params);
                 launchWrapperAysnc("opt_vector_cvt_f16_f32_opt", blocksPerGrid, threadsPerBlock, params, ctx.rppBinMod,
                                    ctx.kernelStream);
@@ -543,13 +985,13 @@ inline void rpp_elementwise_build_tiled(rpp_kernel_context & ctx,
     }
 
     rppStreamEndCapture(ctx.kernelStream, &ctx.graph);
-    if (is_instantial) {
-        rppGraphInstantiate(&ctx.graphexec, ctx.graph, NULL, NULL, 0);
+    const std::string graph_key =
+        rpp_join_function_name_and_args(__func__, "broadcast_materialized_v2", (int) type, C, H, W, axis,
+                                        in0_bytes_per_element, in1_bytes_per_element, out_bytes_per_element);
+    if (rpp_graph_instantiate(ctx.graphexec, ctx.graph, graph_key.c_str(), is_instantial) != RPP_SUCCESS) {
+        throw std::runtime_error("rpp_graph_instantiate failed.");
     }
 
-    if (reciprocal_table != nullptr) {
-        free(reciprocal_table);
-    }
 }
 
 inline void rpp_elementwise_build_tiled_pipeline(rpp_kernel_context & ctx,
@@ -569,7 +1011,7 @@ inline void rpp_elementwise_build_tiled_pipeline(rpp_kernel_context & ctx,
     RPPdeviceptr          devB;
     bool                  ab_switched = false;
 
-    if (axis <= 2 || axis == 6) {
+    if (axis <= 2 || axis == 6 || axis == 8) {
         devA = ctx.dev_in[0];
         devB = ctx.dev_in[1];
     } else {
@@ -586,24 +1028,15 @@ inline void rpp_elementwise_build_tiled_pipeline(rpp_kernel_context & ctx,
 
     RPPdeviceptr devC = ctx.dev_out[0];
 
-    void * reciprocal_table       = nullptr;
-    int    reciprocal_table_bytes = 0;
+    RPPdeviceptr dev_reciprocal_lut    = 0;
+    int          reciprocal_table_bytes = 0;
     if (type == RPP_ELEMWISE_DIV) {
         reciprocal_table_bytes = 65536 * (int) sizeof(uint16_t);
-        reciprocal_table       = malloc(reciprocal_table_bytes);
-        for (uint32_t i = 0; i < 65536; ++i) {
-            uint32_t x = i;
-            x <<= 16;
-            float y                            = 1.0f / *(float *) &x;
-            ((uint16_t *) reciprocal_table)[i] = rpp::bfloat16::round_to_bfloat16(y).value;
-        }
-        ((uint16_t *) reciprocal_table)[0]      = 0;
-        ((uint16_t *) reciprocal_table)[0x8000] = 0;
-        rtMemcpy((void *) ctx.dev_workspace, reciprocal_table, reciprocal_table_bytes, rtMemcpyHostToDevice);
+        dev_reciprocal_lut     = rpp_elementwise_prepare_reciprocal_lut_workspace(ctx);
     }
 
     rppStreamBeginCapture(ctx.kernelStream, RPP_STREAM_CAPTURE_MODE_GLOBAL);
-    rppModuleLoad(&ctx.rppBinMod, "rpp_kernel/elementwise.o");
+    rpp_module_load_once(ctx.rppBinMod, "rpp_kernel/elementwise.o");
 
     RPPdeviceptr sram_base                 = ctx.virtual_sram_base;
     RPPdeviceptr sramReciprocalTable       = sram_base;
@@ -620,7 +1053,7 @@ inline void rpp_elementwise_build_tiled_pipeline(rpp_kernel_context & ctx,
                                           out_bytes_per_element, reciprocal_table_bytes, tile_sram_budget);
 
     if (type == RPP_ELEMWISE_DIV) {
-        rtMemcpyAsync((void *) sramReciprocalTable, (const void *) ctx.dev_workspace, reciprocal_table_bytes,
+        rtMemcpyAsync((void *) sramReciprocalTable, (const void *) dev_reciprocal_lut, reciprocal_table_bytes,
                       rtMemcpyDeviceToSram, ctx.kernelStream);
     }
 
@@ -647,6 +1080,9 @@ inline void rpp_elementwise_build_tiled_pipeline(rpp_kernel_context & ctx,
                           (const void *) (devSrc + (RPPdeviceptr) h * W * elem_bytes), W * elem_bytes,
                           rtMemcpyDeviceToSram, stream);
         }
+    };
+    auto copy_scalar_from_dev_async = [&](RPPdeviceptr sramDst, RPPdeviceptr devSrc, int elem_bytes, RPPstream stream) {
+        rtMemcpyAsync((void *) sramDst, (const void *) devSrc, elem_bytes, rtMemcpyDeviceToSram, stream);
     };
 
     struct tile_meta_t {
@@ -699,12 +1135,20 @@ inline void rpp_elementwise_build_tiled_pipeline(rpp_kernel_context & ctx,
             }
 
             if (in1_bytes_per_element == (int) sizeof(float)) {
-                rtMemcpyAsync((void *) sramBCompact, (const void *) (devB + (RPPdeviceptr) devB_offset), sizeB,
-                              rtMemcpyDeviceToSram, ctx.dmaStream);
+                if (axis == 8) {
+                    copy_scalar_from_dev_async(sramBCompact, devB + (RPPdeviceptr) devB_offset, in1_bytes_per_element,
+                                               ctx.dmaStream);
+                } else {
+                    rtMemcpyAsync((void *) sramBCompact, (const void *) (devB + (RPPdeviceptr) devB_offset), sizeB,
+                                  rtMemcpyDeviceToSram, ctx.dmaStream);
+                }
             } else {
                 if (axis == -1 || axis == 0) {
                     copy_rows_from_dev_async(sramBPadded, devB + (RPPdeviceptr) devB_offset, tile_H, row_bytes_bf16,
                                              (int) sizeof(uint16_t), ctx.dmaStream);
+                } else if (axis == 8) {
+                    copy_scalar_from_dev_async(sramBPadded, devB + (RPPdeviceptr) devB_offset, in1_bytes_per_element,
+                                               ctx.dmaStream);
                 } else {
                     rtMemcpyAsync((void *) sramBPadded, (const void *) (devB + (RPPdeviceptr) devB_offset),
                                   W * (int) sizeof(uint16_t), rtMemcpyDeviceToSram, ctx.dmaStream);
@@ -715,8 +1159,13 @@ inline void rpp_elementwise_build_tiled_pipeline(rpp_kernel_context & ctx,
             RPPdeviceptr sramB = sramA + rpp_elementwise_round_up(sizeA);
             rtMemcpyAsync((void *) sramA, (const void *) (devA + (RPPdeviceptr) devA_offset), sizeA,
                           rtMemcpyDeviceToSram, ctx.dmaStream);
-            rtMemcpyAsync((void *) sramB, (const void *) (devB + (RPPdeviceptr) devB_offset), sizeB,
-                          rtMemcpyDeviceToSram, ctx.dmaStream);
+            if (axis == 8) {
+                copy_scalar_from_dev_async(sramB, devB + (RPPdeviceptr) devB_offset, in1_bytes_per_element,
+                                           ctx.dmaStream);
+            } else {
+                rtMemcpyAsync((void *) sramB, (const void *) (devB + (RPPdeviceptr) devB_offset), sizeB,
+                              rtMemcpyDeviceToSram, ctx.dmaStream);
+            }
         }
         rppEventRecord(ctx.dma_done_ping[ping], ctx.dmaStream);
     };
@@ -774,7 +1223,8 @@ inline void rpp_elementwise_build_tiled_pipeline(rpp_kernel_context & ctx,
                 const int sizeA_compact  = sizeA;
                 const int sizeB_compact  = sizeB;
                 const int sizeA_padded   = tile_H * row_bytes_bf16;
-                const int sizeB_padded   = (axis == -1 || axis == 0) ? tile_H * row_bytes_bf16 : row_bytes_bf16;
+                const int sizeB_padded   = (axis == -1 || axis == 0) ? tile_H * row_bytes_bf16 :
+                                           (axis == 8) ? (int) sizeof(uint16_t) : row_bytes_bf16;
                 const int sizeOut_padded = tile_H * row_bytes_bf16;
 
                 int sram_cursor        = 0;
@@ -835,8 +1285,6 @@ inline void rpp_elementwise_build_tiled_pipeline(rpp_kernel_context & ctx,
             const int           sizeA       = tile.sizeA;
             const int           sizeB       = tile.sizeB;
             const int           sizeC       = tile.sizeC;
-            const size_t        devA_offset = tile.devA_offset;
-            const size_t        devB_offset = tile.devB_offset;
             const size_t        devC_offset = tile.devC_offset;
 
             rppStreamWaitEvent(ctx.kernelStream, ctx.dma_done_ping[ping], 0);
@@ -879,6 +1327,13 @@ inline void rpp_elementwise_build_tiled_pipeline(rpp_kernel_context & ctx,
                 if (in1_bytes_per_element == (int) sizeof(float)) {
                     if (axis == -1 || axis == 0) {
                         convert_rows_f32_to_bf16(sramBCompact, sramBPadded, tile_H);
+                    } else if (axis == 8) {
+                        calc_tbdim_flattern(1, 1, threadsPerBlock, blocksPerGrid);
+                        params.clear();
+                        cvt_kernel_param_init(threadsPerBlock, (uint32_t) sramBCompact, (uint32_t) sramBPadded, kFLOAT,
+                                              kBF16, params);
+                        launchWrapperAysnc("opt_vector_cvt_32_16", blocksPerGrid, threadsPerBlock, params,
+                                           ctx.rppBinMod, ctx.kernelStream);
                     } else {
                         calc_tbdim_flattern(1, W, threadsPerBlock, blocksPerGrid);
                         params.clear();
@@ -920,10 +1375,10 @@ inline void rpp_elementwise_build_tiled_pipeline(rpp_kernel_context & ctx,
                 params.emplace_back((uint32_t) sramBPadded);
                 params.emplace_back((uint32_t) sramOutPadded);
                 params.emplace_back(row_bytes_bf16);
-                params.emplace_back((axis == 1 || axis == 6 || axis == 7) ? 0 : row_bytes_bf16);
+                params.emplace_back(rpp_elementwise_input1_is_row_broadcast(axis) ? 0 : row_bytes_bf16);
                 params.emplace_back(tile_H);
                 params.emplace_back(padded_W);
-                params.emplace_back((axis == 1 || axis == 6 || axis == 7) ? 0 : padded_W);
+                params.emplace_back(rpp_elementwise_input1_is_row_broadcast(axis) ? 0 : padded_W);
                 if (type == RPP_ELEMWISE_ADD) {
                     launchWrapperAysnc("elementwise_add", blocksPerGrid, threadsPerBlock, params, ctx.rppBinMod,
                                        ctx.kernelStream);
@@ -971,7 +1426,9 @@ inline void rpp_elementwise_build_tiled_pipeline(rpp_kernel_context & ctx,
                 if (in1_bytes_per_element == (int) sizeof(float)) {
                     if (axis == -1 || axis == 0) {
                         calc_tbdim_flattern(tile_H, W, threadsPerBlock, blocksPerGrid);
-                    } else if (axis == 1 || axis == 6 || axis == 7) {
+                    } else if (axis == 8) {
+                        calc_tbdim_flattern(1, 1, threadsPerBlock, blocksPerGrid);
+                    } else if (rpp_elementwise_input1_is_row_broadcast(axis)) {
                         calc_tbdim_flattern(1, W, threadsPerBlock, blocksPerGrid);
                     } else if (axis == 2) {
                         calc_tbdim_flattern(1, tile_H, threadsPerBlock, blocksPerGrid);
@@ -998,7 +1455,9 @@ inline void rpp_elementwise_build_tiled_pipeline(rpp_kernel_context & ctx,
                     } else {
                         if (axis == -1 || axis == 0) {
                             calc_tbdim_flattern(tile_H, W, threadsPerBlock, blocksPerGrid);
-                        } else if (axis == 1 || axis == 6 || axis == 7) {
+                        } else if (axis == 8) {
+                            calc_tbdim_flattern(1, 1, threadsPerBlock, blocksPerGrid);
+                        } else if (rpp_elementwise_input1_is_row_broadcast(axis)) {
                             calc_tbdim_flattern(1, W, threadsPerBlock, blocksPerGrid);
                         } else if (axis == 2) {
                             calc_tbdim_flattern(1, tile_H, threadsPerBlock, blocksPerGrid);
@@ -1016,7 +1475,7 @@ inline void rpp_elementwise_build_tiled_pipeline(rpp_kernel_context & ctx,
                     }
                 }
 
-                if (W * tile_H < 8192) {
+                if (W * tile_H < 8192 && !rpp_elementwise_input1_is_row_broadcast(axis)) {
                     threadsPerBlock.x = W;
                     threadsPerBlock.y = 1;
                     threadsPerBlock.z = tile_H;
@@ -1048,7 +1507,7 @@ inline void rpp_elementwise_build_tiled_pipeline(rpp_kernel_context & ctx,
                 uint32_t offset1  = threadsPerBlock.x * threadsPerBlock.z * sizeof(uint16_t);
                 uint32_t stridez1 = threadsPerBlock.x;
                 blocksPerGrid.z   = 1;
-                if (axis == 1 || axis == 6 || axis == 7) {
+                if (rpp_elementwise_input1_is_row_broadcast(axis)) {
                     offset1  = 0;
                     stridez1 = 0;
                 }
@@ -1097,7 +1556,7 @@ inline void rpp_elementwise_build_tiled_pipeline(rpp_kernel_context & ctx,
 
                 if (out_bytes_per_element == (int) sizeof(float)) {
                     params.clear();
-                    calc_tbdim_flattern(tile_H * 2, W, threadsPerBlock, blocksPerGrid);
+                    calc_tbdim_flattern(tile_H, W * 2, threadsPerBlock, blocksPerGrid);
                     cvt_kernel_param_init_opt(threadsPerBlock, (uint32_t) sramA, (uint32_t) sramC, kBF16, kFLOAT,
                                               params);
                     launchWrapperAysnc("opt_vector_cvt_f16_f32_opt", blocksPerGrid, threadsPerBlock, params,
@@ -1116,13 +1575,13 @@ inline void rpp_elementwise_build_tiled_pipeline(rpp_kernel_context & ctx,
     }
 
     rppStreamEndCapture(ctx.kernelStream, &ctx.graph);
-    if (is_instantial) {
-        rppGraphInstantiate(&ctx.graphexec, ctx.graph, NULL, NULL, 0);
+    const std::string graph_key =
+        rpp_join_function_name_and_args(__func__, (int) type, C, H, W, axis, in0_bytes_per_element,
+                                        in1_bytes_per_element, out_bytes_per_element);
+    if (rpp_graph_instantiate(ctx.graphexec, ctx.graph, graph_key.c_str(), is_instantial) != RPP_SUCCESS) {
+        throw std::runtime_error("rpp_graph_instantiate failed.");
     }
 
-    if (reciprocal_table != nullptr) {
-        free(reciprocal_table);
-    }
 }
 
 // -----------------------------
@@ -1139,6 +1598,13 @@ static void rpp_elementwise_build(rpp_kernel_context & ctx,
                                   int                  out_bytes_per_element,
                                   int                  use_pipeline  = 0,
                                   int                  is_instantial = 1) {
+    if (type == RPP_ELEMWISE_MUL && rpp_elementwise_input1_is_scalar_broadcast(axis)) {
+        (void) use_pipeline;
+        rpp_elementwise_build_mul_broadcast(ctx, C, H, W, axis, in0_bytes_per_element, in1_bytes_per_element,
+                                            out_bytes_per_element, is_instantial);
+        return;
+    }
+
     // if (use_pipeline) {
     //     rpp_elementwise_build_tiled_pipeline(ctx, type, C, H, W, axis, in0_bytes_per_element, in1_bytes_per_element,
     //                                         out_bytes_per_element, is_instantial);

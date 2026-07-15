@@ -19,12 +19,13 @@ static bool ggml_rpp_create_kernel_mul(ggml_backend_rpp_context & ctx,
     int       H       = 0;
     int       W       = 0;
     if (rpp_node->seq_len_index == 2) {
-        C = (ctx.use_ubatch && seq_len > 1) ? rpp_node->n_ubatch : dst->src[0]->ne[2];
+        (void) seq_len;
+        C = dst->src[0]->ne[2];
         H = dst->ne[1];
         W = dst->ne[0];
     } else if (rpp_node->seq_len_index == 1) {
         C = dst->ne[2];
-        H = (ctx.use_ubatch && seq_len > 1) ? rpp_node->n_ubatch : dst->src[0]->ne[1];
+        H = dst->src[0]->ne[1];
         W = dst->ne[0];
     }
 
@@ -114,17 +115,11 @@ static bool ggml_rpp_mul_properties_is_same(ggml_backend_rpp_context & ctx,
     if (node->op != graph_node_properties.node_op) {
         return false;
     }
-    if (rpp_node->n_ubatch == 1) {
-        for (int i = 0; i < GGML_MAX_DIMS; i++) {
-            if (node->ne[i] != graph_node_properties.ne[i]) {
-                return false;
-            }
-            if (node->nb[i] != graph_node_properties.nb[i]) {
-                return false;
-            }
+    for (int i = 0; i < GGML_MAX_DIMS; i++) {
+        if (node->ne[i] != graph_node_properties.ne[i]) {
+            return false;
         }
-    } else {
-        if (dst->ne[rpp_node->seq_len_index] == 1) {
+        if (node->nb[i] != graph_node_properties.nb[i]) {
             return false;
         }
     }
@@ -132,6 +127,17 @@ static bool ggml_rpp_mul_properties_is_same(ggml_backend_rpp_context & ctx,
         if (node->src[i] && node->src[i]->data != graph_node_properties.src_address[i] && node->op != GGML_OP_CPY &&
             node->op != GGML_OP_VIEW) {
             return false;
+        }
+        if (node->src[i] && rpp_node->ggml_node_properties.count(node->src[i])) {
+            const auto & src_properties = rpp_node->ggml_node_properties[node->src[i]];
+            for (int j = 0; j < GGML_MAX_DIMS; j++) {
+                if (node->src[i]->ne[j] != src_properties.ne[j]) {
+                    return false;
+                }
+                if (node->src[i]->nb[j] != src_properties.nb[j]) {
+                    return false;
+                }
+            }
         }
     }
     if (node->op == GGML_OP_SCALE &&

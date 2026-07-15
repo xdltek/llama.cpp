@@ -49,7 +49,7 @@ static void rpp_reduce_sum_build(rpp_kernel_context & ctx,
 
     rppStreamBeginCapture(ctx.kernelStream, RPP_STREAM_CAPTURE_MODE_GLOBAL);
     RPPmodule cuMod;
-    rppModuleLoad(&ctx.rppBinMod, "rpp_kernel/reduce_sum.o");
+    rpp_module_load_once(ctx.rppBinMod, "rpp_kernel/reduce_sum.o");
 
     // -------------------------
     // SRAM allocation planning
@@ -140,7 +140,9 @@ static void rpp_reduce_sum_build(rpp_kernel_context & ctx,
 
     // End capture after all enqueued work is defined
     rppStreamEndCapture(ctx.kernelStream, &ctx.graph);
-    if (is_instantial) {
-        rppGraphInstantiate(&ctx.graphexec, ctx.graph, NULL, NULL, 0);
+    const std::string graph_key =
+        rpp_join_function_name_and_args(__func__, C, H, W, axis, in_bytes_per_element, out_bytes_per_element);
+    if (rpp_graph_instantiate(ctx.graphexec, ctx.graph, graph_key.c_str(), is_instantial) != RPP_SUCCESS) {
+        throw std::runtime_error("rpp_graph_instantiate failed.");
     }
 }

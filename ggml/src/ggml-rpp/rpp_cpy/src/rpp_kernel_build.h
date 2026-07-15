@@ -53,7 +53,7 @@ void rpp_copy_build(rpp_kernel_context & ctx,
     const RPPdeviceptr    sram_base = ctx.virtual_sram_base;
 
     rppStreamBeginCapture(ctx.kernelStream, RPP_STREAM_CAPTURE_MODE_GLOBAL);
-    rppModuleLoad(&ctx.rppBinMod, "rpp_kernel/copy.o");
+    rpp_module_load_once(ctx.rppBinMod, "rpp_kernel/copy.o");
 
     for (int i = 0; i < num_of_tiles; ++i) {
         const int tile_elems      = (i == num_of_tiles - 1) ? tail_tiles : norm_tiles;
@@ -97,9 +97,10 @@ void rpp_copy_build(rpp_kernel_context & ctx,
     }
 
     rppStreamEndCapture(ctx.kernelStream, &ctx.graph);
-    if (is_instantial) {
-        if (rppGraphInstantiate(&ctx.graphexec, ctx.graph, NULL, NULL, 0) != RPP_SUCCESS) {
-            throw std::runtime_error("rppGraphInstantiate failed.");
-        }
-    }    
+    const std::string graph_key =
+        rpp_join_function_name_and_args(__func__, elements, (int) inType, (int) outType, in_bytes_per_element,
+                                        out_bytes_per_element);
+    if (rpp_graph_instantiate(ctx.graphexec, ctx.graph, graph_key.c_str(), is_instantial) != RPP_SUCCESS) {
+        throw std::runtime_error("rpp_graph_instantiate failed.");
+    }
 }

@@ -200,7 +200,7 @@ static void rpp_matmul_q2s_vxm_nolut(rpp_kernel_context & ctx,
     if (is_capture) {
         rppStreamBeginCapture(ctx.kernelStream, RPP_STREAM_CAPTURE_MODE_GLOBAL);
     }
-    rppModuleLoad(&ctx.rppBinMod, "rpp_kernel/matmul_q2s_vxm_nolut.o");
+    rpp_module_load_once(ctx.rppBinMod, "rpp_kernel/matmul_q2s_vxm_nolut.o");
 
     int nr_of_tiles, groups_per_tile;
     int nr_of_ns, Ns, NsTail;
@@ -460,9 +460,10 @@ static void rpp_matmul_q2s_vxm_nolut(rpp_kernel_context & ctx,
 
     if (is_capture) {
         rppStreamEndCapture(ctx.kernelStream, &ctx.graph);
-    }
-    if (is_instantial) {
-        rppGraphInstantiate(&ctx.graphexec, ctx.graph, NULL, NULL, 0);
+        const std::string graph_key = rpp_join_function_name_and_args(__func__, M, K, N, weights_group, in_bytes_per_element, out_bytes_per_element);
+        if (rpp_graph_instantiate(ctx.graphexec, ctx.graph, graph_key.c_str(), is_instantial) != RPP_SUCCESS) {
+            throw std::runtime_error("rpp_graph_instantiate failed.");
+        }
     }
 }
 
@@ -501,7 +502,7 @@ static void rpp_matmul_q2s_vxm_nolut_pipeline(rpp_kernel_context & ctx,
     if (is_capture) {
         rppStreamBeginCapture(ctx.kernelStream, RPP_STREAM_CAPTURE_MODE_GLOBAL);
     }
-    rppModuleLoad(&ctx.rppBinMod, "rpp_kernel/matmul_q2s_vxm_nolut.o");
+    rpp_module_load_once(ctx.rppBinMod, "rpp_kernel/matmul_q2s_vxm_nolut.o");
 
     int nr_of_tiles, groups_per_tile;
     int nr_of_ns, Ns, NsTail;
@@ -735,9 +736,10 @@ static void rpp_matmul_q2s_vxm_nolut_pipeline(rpp_kernel_context & ctx,
 
     if (is_capture) {
         rppStreamEndCapture(ctx.kernelStream, &ctx.graph);
-    }
-    if (is_instantial) {
-        rppGraphInstantiate(&ctx.graphexec, ctx.graph, NULL, NULL, 0);
+        const std::string graph_key = rpp_join_function_name_and_args(__func__, M, K, N, weights_group, in_bytes_per_element, out_bytes_per_element);
+        if (rpp_graph_instantiate(ctx.graphexec, ctx.graph, graph_key.c_str(), is_instantial) != RPP_SUCCESS) {
+            throw std::runtime_error("rpp_graph_instantiate failed.");
+        }
     }
 }
 
@@ -789,7 +791,7 @@ static void rpp_matmul_q2s_vxm_nolut_sram(rpp_kernel_context & ctx,
     if (is_capture) {
         rppStreamBeginCapture(ctx.kernelStream, RPP_STREAM_CAPTURE_MODE_GLOBAL);
     }
-    rppModuleLoad(&ctx.rppBinMod, "rpp_kernel/matmul_q2s_vxm_nolut.o");
+    rpp_module_load_once(ctx.rppBinMod, "rpp_kernel/matmul_q2s_vxm_nolut.o");
 
     if (K % weights_group != 0) {
         throw std::runtime_error("Matmul Q2S NoLUT SRAM expects full-K one tile (K % weights_group == 0)");
@@ -940,9 +942,10 @@ static void rpp_matmul_q2s_vxm_nolut_sram(rpp_kernel_context & ctx,
 
     if (is_capture) {
         rppStreamEndCapture(ctx.kernelStream, &ctx.graph);
-    }
-    if (is_instantial) {
-        rppGraphInstantiate(&ctx.graphexec, ctx.graph, NULL, NULL, 0);
+        const std::string graph_key = rpp_join_function_name_and_args(__func__, M, K, N, weights_group, in_bytes_per_element, out_bytes_per_element, experts);
+        if (rpp_graph_instantiate(ctx.graphexec, ctx.graph, graph_key.c_str(), is_instantial) != RPP_SUCCESS) {
+            throw std::runtime_error("rpp_graph_instantiate failed.");
+        }
     }
 }
 

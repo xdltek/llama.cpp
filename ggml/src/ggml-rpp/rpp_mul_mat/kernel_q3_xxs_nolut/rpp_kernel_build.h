@@ -6,10 +6,8 @@
 
 #include <assert.h>
 
-#include <array>
 #include <cstdint>
 #include <cstdlib>
-#include <cstring>
 #include <iostream>
 #include <stdexcept>
 #include <vector>
@@ -79,13 +77,8 @@ static void rpp_matmul_q3xxs_nolut(rpp_kernel_context & ctx,
     const int super_group             = 256;
     const int qscale_lut_elems        = 16;
     const int mag_lut_elems           = (int) kQ3xxsNoLutMagValues.size();
-    const int mat_lut_codes_per_entry = 4;
-    const int mat_lut_rows            = 1 << (3 * mat_lut_codes_per_entry);
-    const int mat_lut_cols            = mat_lut_codes_per_entry;
     const int qscale_lut_bytes        = qscale_lut_elems * (int) sizeof(uint16_t);
     const int mag_lut_bytes           = mag_lut_elems * (int) sizeof(uint16_t);
-    const int mat_lut_bytes           = mat_lut_rows * mat_lut_cols * (int) sizeof(uint16_t);
-    const int lut_workspace_bytes     = qscale_lut_bytes + mag_lut_bytes + mat_lut_bytes;
     if (ctx.dev_in.size() < 5 || ctx.dev_out.empty()) {
         throw std::runtime_error("Q3XXS NoLUT requires 5 input buffers and 1 output buffer");
     }
@@ -117,43 +110,13 @@ static void rpp_matmul_q3xxs_nolut(rpp_kernel_context & ctx,
     RPPdeviceptr devB_sign           = ctx.dev_in[3];
     RPPdeviceptr devB_super_scale    = ctx.dev_in[4];
     RPPdeviceptr devC                = ctx.dev_out[0];
-    RPPdeviceptr dev_lut_workspace   = ctx.dev_workspace;
-    if (dev_lut_workspace == 0) {
-        rtMalloc((void **) &dev_lut_workspace, lut_workspace_bytes);
-        ctx.dev_workspace = dev_lut_workspace;
-    }
+    RPPdeviceptr dev_lut_workspace   = q3xxs_nolut_prepare_lut_workspace(ctx);
 
     RPPdeviceptr devB_qscale_lut = dev_lut_workspace;
     RPPdeviceptr devB_mag_lut    = devB_qscale_lut + qscale_lut_bytes;
-    RPPdeviceptr devB_mat_lut    = devB_mag_lut + mag_lut_bytes;
-
-    std::array<uint16_t, qscale_lut_elems> qscale_lut = {};
-    for (int i = 0; i < qscale_lut_elems; ++i) {
-        const float scale4  = (float) i;
-        const float lut_val = (0.5f + scale4) * 0.5f;
-        qscale_lut[i]       = float_to_bf16_rne(lut_val);
-    }
-
-    std::array<uint16_t, mag_lut_elems> mag_lut = {};
-    for (int i = 0; i < mag_lut_elems; ++i) {
-        mag_lut[i] = float_to_bf16_rne(kQ3xxsNoLutMagValues[(size_t) i]);
-    }
-
-    std::vector<uint16_t> mat_lut((size_t) mat_lut_rows * (size_t) mat_lut_cols, 0);
-    for (int packed = 0; packed < mat_lut_rows; ++packed) {
-        for (int u = 0; u < mat_lut_cols; ++u) {
-            const uint8_t code = (uint8_t) ((packed >> (3 * u)) & 0x7);
-            mat_lut[(size_t) packed * (size_t) mat_lut_cols + (size_t) u] =
-                float_to_bf16_rne(kQ3xxsNoLutMagValues[(size_t) code]);
-        }
-    }
-
-    rtMemcpy((void *) devB_qscale_lut, qscale_lut.data(), qscale_lut_bytes, rtMemcpyHostToDevice);
-    rtMemcpy((void *) devB_mag_lut, mag_lut.data(), mag_lut_bytes, rtMemcpyHostToDevice);
-    rtMemcpy((void *) devB_mat_lut, mat_lut.data(), mat_lut_bytes, rtMemcpyHostToDevice);
 
     rppStreamBeginCapture(ctx.kernelStream, RPP_STREAM_CAPTURE_MODE_GLOBAL);
-    rppModuleLoad(&ctx.rppBinMod, "rpp_kernel/matmul_q3xxs_nolut.o");
+    rpp_module_load_once(ctx.rppBinMod, "rpp_kernel/matmul_q3xxs_nolut.o");
 
     const int sizeA0 = M * K * in_bytes_per_element;
     const int sizeA1 = M * K * (int) sizeof(rpp::bfloat16);
@@ -170,7 +133,6 @@ static void rpp_matmul_q3xxs_nolut(rpp_kernel_context & ctx,
     const int sizeB_super_scale    = (K * MATMUL_NS / super_group) * (int) sizeof(short);
     const int sizeB_qscale_lut     = qscale_lut_bytes;
     const int sizeB_mag_lut        = mag_lut_bytes;
-    const int sizeB_mat_lut        = mat_lut_bytes;
 
     // q3xxs dequant consumes one bf16 scale per 32 weights.
     const int sizeB_scale = (K * MATMUL_NS / q_group) * (int) sizeof(short);
@@ -190,8 +152,7 @@ static void rpp_matmul_q3xxs_nolut(rpp_kernel_context & ctx,
     RPPdeviceptr sramB_super_scale    = sramB_sign + round_up(sizeB_sign);
     RPPdeviceptr sramB_qscale_lut     = sramB_super_scale + round_up(sizeB_super_scale);
     RPPdeviceptr sramB_mag_lut        = sramB_qscale_lut + round_up(sizeB_qscale_lut);
-    RPPdeviceptr sramB_mat_lut        = sramB_mag_lut + round_up(sizeB_mag_lut);
-    RPPdeviceptr sramB_scale          = sramB_mat_lut + round_up(sizeB_mat_lut);
+    RPPdeviceptr sramB_scale          = sramB_mag_lut + round_up(sizeB_mag_lut);
     RPPdeviceptr sramB_out            = sramB_scale + round_up(sizeB_scale);
     RPPdeviceptr sramC_hw32           = sramB_out + round_up(sizeB);
     RPPdeviceptr sramC_chw            = sramC_hw32 + round_up(sizeCr);
@@ -213,8 +174,6 @@ static void rpp_matmul_q3xxs_nolut(rpp_kernel_context & ctx,
     rtMemcpyAsync((void *) sramB_qscale_lut, (const void *) devB_qscale_lut, sizeB_qscale_lut, rtMemcpyDeviceToSram,
                   ctx.kernelStream);
     rtMemcpyAsync((void *) sramB_mag_lut, (const void *) devB_mag_lut, sizeB_mag_lut, rtMemcpyDeviceToSram,
-                  ctx.kernelStream);
-    rtMemcpyAsync((void *) sramB_mat_lut, (const void *) devB_mat_lut, sizeB_mat_lut, rtMemcpyDeviceToSram,
                   ctx.kernelStream);
 
     if (a_is_f32) {
@@ -320,8 +279,9 @@ static void rpp_matmul_q3xxs_nolut(rpp_kernel_context & ctx,
     }
 
     rppStreamEndCapture(ctx.kernelStream, &ctx.graph);
-    if (is_instantial) {
-        rppGraphInstantiate(&ctx.graphexec, ctx.graph, NULL, NULL, 0);
+    const std::string graph_key = rpp_join_function_name_and_args(__func__, M, K, N, weights_group, in_bytes_per_element, out_bytes_per_element);
+    if (rpp_graph_instantiate(ctx.graphexec, ctx.graph, graph_key.c_str(), is_instantial) != RPP_SUCCESS) {
+        throw std::runtime_error("rpp_graph_instantiate failed.");
     }
 }
 
@@ -360,7 +320,7 @@ static void rpp_matmul_q3xxs_nolut_sram(rpp_kernel_context & ctx,
     std::vector<uint32_t> params;
 
     rppStreamBeginCapture(ctx.kernelStream, RPP_STREAM_CAPTURE_MODE_GLOBAL);
-    rppModuleLoad(&ctx.rppBinMod, "rpp_kernel/matmul_q3xxs_nolut.o");
+    rpp_module_load_once(ctx.rppBinMod, "rpp_kernel/matmul_q3xxs_nolut.o");
 
     const bool         a_is_f32 = (in_bytes_per_element == (int) sizeof(float));
     const RPPdeviceptr matmul_A = a_is_f32 ? io.sramA_in : io.sramA_out;
@@ -434,8 +394,9 @@ static void rpp_matmul_q3xxs_nolut_sram(rpp_kernel_context & ctx,
     }
 
     rppStreamEndCapture(ctx.kernelStream, &ctx.graph);
-    if (is_instantial) {
-        rppGraphInstantiate(&ctx.graphexec, ctx.graph, NULL, NULL, 0);
+    const std::string graph_key = rpp_join_function_name_and_args(__func__, M, K, N, weights_group, in_bytes_per_element, out_bytes_per_element);
+    if (rpp_graph_instantiate(ctx.graphexec, ctx.graph, graph_key.c_str(), is_instantial) != RPP_SUCCESS) {
+        throw std::runtime_error("rpp_graph_instantiate failed.");
     }
 }
 

@@ -49,12 +49,6 @@ struct rpp_kernel_expert_routing_fusion : public rpp_node_kernel {
         op = RPP_OP_EXPERT_ROUTING;
     }
 
-    void init_workspace(ggml_backend_rpp_context & ctx) {
-        this->kernel_ctx->dev_workspace = (RPPdeviceptr) (ctx.pool().alloc((65536 * 2) * (int) sizeof(uint16_t)));
-    }
-
-    void init_workspace(RPPdeviceptr dev_workspace) { this->kernel_ctx->dev_workspace = dev_workspace; }
-
     bool rpp_dispatch_func(ggml_backend_rpp_context & ctx,
                            ggml_tensor *              dst,
                            int                        is_instantial = 1,

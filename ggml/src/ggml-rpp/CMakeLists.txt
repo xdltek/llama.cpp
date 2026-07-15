@@ -6,10 +6,10 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 option(GGML_RPP_USE_BF16 "RPP:Enable use bf16 operations" ON)
 if(GGML_RPP_USE_BF16)
     add_definitions(-DGGML_RPP_USE_BF16=1)
-    message(STATUS "RPP: Use bf16 operations     : ENABLED   (-DGGML_RPP_USE_BF16=ON)")
+    message(STATUS "RPP: Use bf16 operations         : ENABLED   (-DGGML_RPP_USE_BF16=ON)")
 else()
     add_definitions(-DGGML_RPP_USE_BF16=0)
-    message(STATUS "RPP: Use bf16 operations     : DISABLED  (-DGGML_RPP_USE_BF16=OFF)")
+    message(STATUS "RPP: Use bf16 operations         : DISABLED  (-DGGML_RPP_USE_BF16=OFF)")
 endif()
 
 option(GGML_RPP_PERF_TRACE "Enable Perfetto tracing" OFF)
@@ -153,7 +153,11 @@ file(GLOB GGML_RPP_SOURCES
     "${CMAKE_CURRENT_SOURCE_DIR}/rpp_reduce_sum/src/*.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/rpp_expert_routing/src/*.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/rpp_unary/src/*.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/rpp_tanh/src/*.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/rpp_clamp/src/*.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/rpp_concat/src/*.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/rpp_expert_forward/src/*.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/rpp_conv2d/src/*.cpp"
 )
 
 ggml_add_backend_library(ggml-rpp ${GGML_RPP_SOURCES})
@@ -173,8 +177,9 @@ if (CMAKE_SYSTEM_NAME STREQUAL "Windows" AND TARGET ggml-cpu)
     endif()
 endif()
 
-# copy .o file
-add_custom_command(TARGET ggml-rpp POST_BUILD
+# copy .o files every build; copy_if_different keeps this cheap while allowing
+# externally rebuilt kernels to be synced without relinking ggml-rpp.
+add_custom_target(ggml-rpp-kernels ALL
   COMMAND ${CMAKE_COMMAND} -E make_directory
           "$<TARGET_FILE_DIR:ggml-rpp>/rpp_kernel"
   COMMAND ${CMAKE_COMMAND} -E copy_if_different
@@ -204,6 +209,9 @@ add_custom_command(TARGET ggml-rpp POST_BUILD
   COMMAND ${CMAKE_COMMAND} -E copy_if_different
           "${CMAKE_CURRENT_SOURCE_DIR}/rpp_glu/kernel_swiglu/silu.o"
           "$<TARGET_FILE_DIR:ggml-rpp>/rpp_kernel/silu.o"
+  COMMAND ${CMAKE_COMMAND} -E copy_if_different
+          "${CMAKE_CURRENT_SOURCE_DIR}/rpp_tanh/kernel/tanh.o"
+          "$<TARGET_FILE_DIR:ggml-rpp>/rpp_kernel/tanh.o"
   COMMAND ${CMAKE_COMMAND} -E copy_if_different
           "${CMAKE_CURRENT_SOURCE_DIR}/rpp_flash_attn_ext/kernel/flash_atten.o"
           "$<TARGET_FILE_DIR:ggml-rpp>/rpp_kernel/flash_atten.o"
@@ -299,8 +307,13 @@ add_custom_command(TARGET ggml-rpp POST_BUILD
           "$<TARGET_FILE_DIR:ggml-rpp>/rpp_kernel/matmul_id_fusion.o" 
   COMMAND ${CMAKE_COMMAND} -E copy_if_different
           "${CMAKE_CURRENT_SOURCE_DIR}/rpp_expert_forward/kernel_vxm/kernel_topk_combine/topk_combine.o"
-          "$<TARGET_FILE_DIR:ggml-rpp>/rpp_kernel/topk_combine.o"   
+          "$<TARGET_FILE_DIR:ggml-rpp>/rpp_kernel/topk_combine.o"
+  COMMAND ${CMAKE_COMMAND} -E copy_if_different
+          "${CMAKE_CURRENT_SOURCE_DIR}/rpp_conv2d/kernel/conv_bf16.o"
+          "$<TARGET_FILE_DIR:ggml-rpp>/rpp_kernel/conv_bf16.o"    
 )
+
+add_dependencies(ggml-rpp-kernels ggml-rpp)
 
 # install to CMAKE_INSTALL_BINDIR
 install(DIRECTORY 

@@ -30,7 +30,7 @@ static inline bool rpp_cont_supports_dma(int use_dyn_d0,
     if (cont_x && (cont_y || (use_dyn_d0 && oD0 == 1 && oD1 > 1))) {
         return true;
     }
-    if (cont_x) {
+    if (cont_x && !use_dyn_d0) {
         return true;
     }
     return false;
@@ -67,7 +67,7 @@ void rpp_cont_build(rpp_kernel_context & ctx,
 
     rppStreamBeginCapture(dmaStream, RPP_STREAM_CAPTURE_MODE_GLOBAL);
     RPPmodule cuMod;
-    rppModuleLoad(&ctx.rppBinMod, "rpp_kernel/cont.o");
+    rpp_module_load_once(ctx.rppBinMod, "rpp_kernel/cont.o");
 
     if (cont_x && cont_y && cont_z && !use_dyn_d0) {
         // Fully contiguous: 1D DMA for whole tensor
@@ -151,7 +151,10 @@ void rpp_cont_build(rpp_kernel_context & ctx,
     }
 
     rppStreamEndCapture(dmaStream, &ctx.graph);
-    if (is_instantial) {
-        rppGraphInstantiate(&ctx.graphexec, ctx.graph, NULL, NULL, 0);
+    const std::string graph_key =
+        rpp_join_function_name_and_args(__func__, use_dyn_d0, oD0, oD1, oD2, in_stride_x, in_stride_y,
+                                        in_stride_z, bytes_per_element);
+    if (rpp_graph_instantiate(ctx.graphexec, ctx.graph, graph_key.c_str(), is_instantial) != RPP_SUCCESS) {
+        throw std::runtime_error("rpp_graph_instantiate failed.");
     }
 }

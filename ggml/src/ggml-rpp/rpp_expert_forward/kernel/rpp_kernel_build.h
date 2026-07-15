@@ -37,8 +37,6 @@ constexpr int      kGateTn                          = 4;
 constexpr int      kDynamicMatmulBlockY             = 128;
 constexpr int      kQ2FamilyFusionElementsPerThread = 32;
 constexpr uint32_t kSiluLutBytes                    = 64u * 1024u * (uint32_t) sizeof(uint16_t);
-constexpr uint32_t kQuantLutWorkspaceBytes          = kernel_q3_xxs_nolut::q3xxs_nolut_lut_workspace::total_bytes;
-constexpr uint32_t kFusionLutWorkspaceBytes         = kQuantLutWorkspaceBytes + kSiluLutBytes;
 constexpr uint32_t kMatmulBlockX                    = 32;
 constexpr uint64_t kMatidFramBank0Base              = 0x1006000800ull;
 constexpr uint64_t kMatidFramBank1Base              = 0x1006001800ull;
@@ -895,12 +893,6 @@ inline fusion_sram_layout make_gate_up_sram_layout(const rpp_kernel_context &  c
     return out;
 }
 
-inline void ensure_fusion_lut_workspace(rpp_kernel_context & ctx) {
-    if (ctx.dev_workspace == 0) {
-        rtMalloc((void **) &ctx.dev_workspace, kFusionLutWorkspaceBytes);
-    }
-}
-
 static void q2xs_super_scale_params_matid(uint32_t                in_scale,
                                           uint32_t                in_super_scale,
                                           uint32_t                in_lut,
@@ -1305,15 +1297,15 @@ inline void copy_gate_up_inputs_to_sram(const fusion_device_inputs & inputs,
     copy_packed_route_inputs_to_sram(inputs, io, B, has_topk_merge, stream);
 }
 
-inline RPPdeviceptr prepare_quant_lut_workspace(rpp_kernel_context & ctx, int quant) {
-    ensure_fusion_lut_workspace(ctx);
+inline RPPdeviceptr prepare_quant_lut_workspace(int quant) {
+    rpp_kernel_context lut_ctx{};
     switch (quant) {
         case 0:
-            return kernel_q2_s_nolut::q2s_nolut_prepare_lut_workspace(ctx);
+            return kernel_q2_s_nolut::q2s_nolut_prepare_lut_workspace(lut_ctx);
         case 1:
-            return kernel_q2_xs_nolut::q2xs_nolut_prepare_lut_workspace(ctx);
+            return kernel_q2_xs_nolut::q2xs_nolut_prepare_lut_workspace(lut_ctx);
         case 2:
-            return kernel_q3_xxs_nolut::q3xxs_nolut_prepare_lut_workspace(ctx);
+            return kernel_q3_xxs_nolut::q3xxs_nolut_prepare_lut_workspace(lut_ctx);
         default:
             std::abort();
     }
@@ -1323,7 +1315,8 @@ inline void copy_quant_lut_to_sram(rpp_kernel_context &          ctx,
                                    const quant_lut_sram_window & lut,
                                    int                           quant,
                                    RPPstream &                   stream) {
-    const RPPdeviceptr dev_lut_workspace = prepare_quant_lut_workspace(ctx, quant);
+    (void) ctx;
+    const RPPdeviceptr dev_lut_workspace = prepare_quant_lut_workspace(quant);
     const uint32_t     qscale_bytes      = quant_qscale_lut_bytes(quant);
     const uint32_t     mag_bytes         = quant_mag_lut_bytes(quant);
     rtMemcpyAsync((void *) lut.qscale, (const void *) dev_lut_workspace, qscale_bytes, rtMemcpyDeviceToSram, stream);
@@ -1343,17 +1336,9 @@ inline void copy_quant_lut_to_sram(RPPdeviceptr                  dev_lut_workspa
 }
 
 inline void copy_silu_lut_to_sram(rpp_kernel_context & ctx, const fusion_sram_layout & io, RPPstream & stream) {
-    ensure_fusion_lut_workspace(ctx);
-
-    std::vector<uint16_t> silu_lut(kSiluLutBytes / (uint32_t) sizeof(uint16_t), 0);
-    for (uint32_t i = 0; i < (uint32_t) silu_lut.size(); ++i) {
-        const float x = bf16_to_float((uint16_t) i);
-        const float y = x / (1.0f + std::exp(-x));
-        silu_lut[i]   = float_to_bf16(y);
-    }
-
-    const RPPdeviceptr dev_silu_lut_workspace = ctx.dev_workspace + kQuantLutWorkspaceBytes;
-    rtMemcpy((void *) dev_silu_lut_workspace, silu_lut.data(), kSiluLutBytes, rtMemcpyHostToDevice);
+    (void) ctx;
+    rpp_kernel_context silu_ctx{};
+    const RPPdeviceptr dev_silu_lut_workspace = kernel_swiglu::silu_prepare_lut_workspace(silu_ctx);
     rtMemcpyAsync((void *) io.silu_lut, (const void *) dev_silu_lut_workspace, kSiluLutBytes, rtMemcpyDeviceToSram,
                   stream);
 }
@@ -2041,68 +2026,89 @@ template <typename CaptureFn>
 inline void capture_graph_on_stream(RPPstream      stream,
                                     RPPgraph &     graph,
                                     RPPgraphExec & graphexec,
+                                    const char *   graph_key,
                                     CaptureFn &&   capture_fn) {
     rppGraphCreate(&graph, 0);
     rppStreamBeginCapture(stream, RPP_STREAM_CAPTURE_MODE_GLOBAL);
     capture_fn();
     rppStreamEndCapture(stream, &graph);
-    rppGraphInstantiate(&graphexec, graph, NULL, NULL, 0);
+    RPP_CHECK(rpp_graph_instantiate(graphexec, graph, graph_key, 1));
 }
 
-inline void capture_experts_input_graph(rpp_kernel_context &       ctx,
-                                        const fusion_sram_layout & io,
-                                        int                        B,
-                                        int                        K,
-                                        int                        in_bytes_per_element,
-                                        bool                       has_topk_merge,
-                                        int                        final_cols,
-                                        fusion_graph_bundle &      graphs) {
-    capture_graph_on_stream(ctx.kernelStream, graphs.experts_input_graph, graphs.experts_input_exec, [&]() {
+struct fusion_graph_key_params {
+    int B                     = 0;
+    int K                     = 0;
+    int N                     = 0;
+    int nr_of_experts         = 0;
+    int in_bytes_per_element  = 0;
+    int out_bytes_per_element = 0;
+    int mat0_quant            = 0;
+    int mat1_quant            = 0;
+    int mat2_quant            = 0;
+};
+
+inline std::string fusion_graph_key(const char * func_name, const fusion_graph_key_params & params) {
+    return rpp_join_function_name_and_args(func_name, params.B, params.K, params.N, params.nr_of_experts,
+                                           params.in_bytes_per_element, params.out_bytes_per_element,
+                                           params.mat0_quant, params.mat1_quant, params.mat2_quant);
+}
+
+inline void capture_experts_input_graph(rpp_kernel_context &             ctx,
+                                        const fusion_sram_layout &       io,
+                                        const fusion_graph_key_params & key_params,
+                                        bool                             has_topk_merge,
+                                        int                              final_cols,
+                                        fusion_graph_bundle &            graphs) {
+    const std::string graph_key = fusion_graph_key(__func__, key_params);
+    capture_graph_on_stream(ctx.kernelStream, graphs.experts_input_graph, graphs.experts_input_exec,
+                            graph_key.c_str(), [&]() {
         if (has_topk_merge) {
-            launch_fill_zero_bf16(io.merged_chw_bf16, B * final_cols, ctx.rppBinMod, ctx.kernelStream);
+            launch_fill_zero_bf16(io.merged_chw_bf16, key_params.B * final_cols, ctx.rppBinMod, ctx.kernelStream);
         }
-        if (in_bytes_per_element == kFloatBytes) {
-            launch_cvt_f32_to_bf16(io.sparse_input, io.sparse_bf16, B * K, ctx.rppBinMod, ctx.kernelStream);
+        if (key_params.in_bytes_per_element == kFloatBytes) {
+            launch_cvt_f32_to_bf16(io.sparse_input, io.sparse_bf16, key_params.B * key_params.K, ctx.rppBinMod,
+                                   ctx.kernelStream);
         }
         launch_init_expert_id(0, ctx.rppBinMod, ctx.kernelStream);
         launch_init_expert_id(0, ctx.rppBinMod, ctx.kernelStream);
     });
 }
 
-inline void capture_single_expert_graph(rpp_kernel_context &        ctx,
-                                        RPPdeviceptr                expert_counts_phys,
-                                        RPPdeviceptr                expert_offsets_phys,
-                                        const fusion_sram_layout &  io,
-                                        const quant_weight_layout & gate_weights,
-                                        const quant_weight_layout & up_weights,
-                                        const quant_weight_layout & down_weights,
-                                        int                         mat0_quant,
-                                        int                         mat1_quant,
-                                        int                         mat2_quant,
-                                        bool                        has_down_stage,
-                                        bool                        has_topk_merge,
-                                        int                         K,
-                                        int                         N,
-                                        fusion_graph_bundle &       graphs) {
-    const int final_cols = has_down_stage ? K : N;
-    capture_graph_on_stream(ctx.kernelStream, graphs.single_expert_graph, graphs.single_expert_exec, [&]() {
+inline void capture_single_expert_graph(rpp_kernel_context &             ctx,
+                                        RPPdeviceptr                      expert_counts_phys,
+                                        RPPdeviceptr                      expert_offsets_phys,
+                                        const fusion_sram_layout &        io,
+                                        const quant_weight_layout &       gate_weights,
+                                        const quant_weight_layout &       up_weights,
+                                        const quant_weight_layout &       down_weights,
+                                        bool                              has_down_stage,
+                                        bool                              has_topk_merge,
+                                        const fusion_graph_key_params &   key_params,
+                                        fusion_graph_bundle &             graphs) {
+    const int final_cols = has_down_stage ? key_params.K : key_params.N;
+    const std::string graph_key = fusion_graph_key(__func__, key_params);
+    capture_graph_on_stream(ctx.kernelStream, graphs.single_expert_graph, graphs.single_expert_exec, graph_key.c_str(),
+                            [&]() {
         launch_dma_expert_params_to_fram(expert_counts_phys, expert_offsets_phys, ctx.rppBinMod, ctx.kernelStream);
-        launch_gather_expert_tokens(io.sparse_bf16, io.dense_bf16, io.token_ids, K, ctx.rppBinMod, ctx.kernelStream);
-        launch_chw_to_chw32_dyn(io.dense_bf16, io.dense_hw32, 1, K, ctx.rppBinMod, ctx.kernelStream);
+        launch_gather_expert_tokens(io.sparse_bf16, io.dense_bf16, io.token_ids, key_params.K, ctx.rppBinMod,
+                                    ctx.kernelStream);
+        launch_chw_to_chw32_dyn(io.dense_bf16, io.dense_hw32, 1, key_params.K, ctx.rppBinMod, ctx.kernelStream);
 
-        run_quant_matmul_from_preloaded_sram(ctx, io.gate_weight, io.gate_lut, io, gate_weights, mat0_quant,
-                                             io.dense_hw32, 1, K, N, io.gate_chw_bf16);
-        run_quant_matmul_from_preloaded_sram(ctx, io.up_weight, io.up_lut, io, up_weights, mat1_quant, io.dense_hw32, 1,
-                                             K, N, io.up_chw_bf16);
+        run_quant_matmul_from_preloaded_sram(ctx, io.gate_weight, io.gate_lut, io, gate_weights,
+                                             key_params.mat0_quant, io.dense_hw32, 1, key_params.K, key_params.N,
+                                             io.gate_chw_bf16);
+        run_quant_matmul_from_preloaded_sram(ctx, io.up_weight, io.up_lut, io, up_weights, key_params.mat1_quant,
+                                             io.dense_hw32, 1, key_params.K, key_params.N, io.up_chw_bf16);
 
-        launch_silu_mode1_bf16(io.gate_chw_bf16, io.up_chw_bf16, io.silu_lut, io.glu_chw_bf16, 1, N, ctx.rppBinMod,
-                               ctx.kernelStream);
+        launch_silu_mode1_bf16(io.gate_chw_bf16, io.up_chw_bf16, io.silu_lut, io.glu_chw_bf16, 1, key_params.N,
+                               ctx.rppBinMod, ctx.kernelStream);
 
         RPPdeviceptr sram_final_bf16 = io.glu_chw_bf16;
         if (has_down_stage) {
-            launch_chw_to_chw32_dyn(io.glu_chw_bf16, io.dense_hw32, 1, N, ctx.rppBinMod, ctx.kernelStream);
-            run_quant_matmul_from_preloaded_sram(ctx, io.down_weight, io.down_lut, io, down_weights, mat2_quant,
-                                                 io.dense_hw32, 1, N, K, io.final_chw_bf16);
+            launch_chw_to_chw32_dyn(io.glu_chw_bf16, io.dense_hw32, 1, key_params.N, ctx.rppBinMod, ctx.kernelStream);
+            run_quant_matmul_from_preloaded_sram(ctx, io.down_weight, io.down_lut, io, down_weights,
+                                                 key_params.mat2_quant, io.dense_hw32, 1, key_params.N, key_params.K,
+                                                 io.final_chw_bf16);
             sram_final_bf16 = io.final_chw_bf16;
         }
 
@@ -2116,26 +2122,30 @@ inline void capture_single_expert_graph(rpp_kernel_context &        ctx,
 }
 
 inline void capture_update_expert_id_graph(rpp_kernel_context & ctx, fusion_graph_bundle & graphs) {
-    capture_graph_on_stream(ctx.kernelStream, graphs.update_expert_id_graph, graphs.update_expert_id_exec, [&]() {
+    const std::string graph_key = rpp_join_function_name_and_args(__func__);
+    capture_graph_on_stream(ctx.kernelStream, graphs.update_expert_id_graph, graphs.update_expert_id_exec,
+                            graph_key.c_str(), [&]() {
         launch_update_next_expert_id(1, ctx.rppBinMod, ctx.kernelStream);
         launch_update_next_expert_id(1, ctx.rppBinMod, ctx.kernelStream);
     });
 }
 
-inline void capture_experts_output_graph(rpp_kernel_context &       ctx,
-                                         const fusion_sram_layout & io,
-                                         int                        elements,
-                                         int                        out_bytes_per_element,
-                                         bool                       has_topk_merge,
-                                         bool                       has_down_stage,
-                                         fusion_graph_bundle &      graphs) {
-    if (out_bytes_per_element != kFloatBytes) {
+inline void capture_experts_output_graph(rpp_kernel_context &             ctx,
+                                         const fusion_sram_layout &       io,
+                                         const fusion_graph_key_params & key_params,
+                                         int                              elements,
+                                         bool                             has_topk_merge,
+                                         bool                             has_down_stage,
+                                         fusion_graph_bundle &            graphs) {
+    if (key_params.out_bytes_per_element != kFloatBytes) {
         return;
     }
 
     const RPPdeviceptr src_bf16 =
         has_topk_merge ? io.merged_chw_bf16 : (has_down_stage ? io.final_chw_bf16 : io.glu_chw_bf16);
-    capture_graph_on_stream(ctx.kernelStream, graphs.experts_output_graph, graphs.experts_output_exec, [&]() {
+    const std::string graph_key = fusion_graph_key(__func__, key_params);
+    capture_graph_on_stream(ctx.kernelStream, graphs.experts_output_graph, graphs.experts_output_exec,
+                            graph_key.c_str(), [&]() {
         launch_cvt_bf16_to_f32(src_bf16, io.final_chw_out, elements, ctx.rppBinMod, ctx.kernelStream);
     });
 }
@@ -2215,7 +2225,7 @@ static void rpp_matmul_id_fusion_build(rpp_kernel_context &  ctx,
         ctx, B, K, N, total_routes, B, in_bytes_per_element, out_bytes_per_element, gate_weights, up_weights,
         mat0_quant, mat1_quant, has_down_stage, has_topk_merge, down_weights, mat2_quant);
 
-    if (rppModuleLoad(&ctx.rppBinMod, "rpp_kernel/matmul_id_fusion.o") != RPP_SUCCESS) {
+    if (rpp_module_load_once(ctx.rppBinMod, "rpp_kernel/matmul_id_fusion.o") != RPP_SUCCESS) {
         throw std::runtime_error("Failed to load matmul_id_fusion.o");
     }
 
@@ -2241,11 +2251,12 @@ static void rpp_matmul_id_fusion_build(rpp_kernel_context &  ctx,
     plan.has_topk_merge        = has_topk_merge;
 
     const int final_cols = has_down_stage ? K : N;
-    capture_experts_input_graph(ctx, io, B, K, in_bytes_per_element, has_topk_merge, final_cols, plan.graphs);
+    const fusion_graph_key_params graph_key_params{ B, K, N, nr_of_experts, in_bytes_per_element,
+                                                    out_bytes_per_element, mat0_quant, mat1_quant, mat2_quant };
+    capture_experts_input_graph(ctx, io, graph_key_params, has_topk_merge, final_cols, plan.graphs);
     capture_single_expert_graph(ctx, expert_counts_phys, expert_offsets_phys, io, gate_weights, up_weights,
-                                down_weights, mat0_quant, mat1_quant, mat2_quant, has_down_stage, has_topk_merge, K, N,
-                                plan.graphs);
-    capture_experts_output_graph(ctx, io, B * final_cols, out_bytes_per_element, has_topk_merge, has_down_stage,
+                                down_weights, has_down_stage, has_topk_merge, graph_key_params, plan.graphs);
+    capture_experts_output_graph(ctx, io, graph_key_params, B * final_cols, has_topk_merge, has_down_stage,
                                  plan.graphs);
 }
 }  // namespace kernel_expert_forward

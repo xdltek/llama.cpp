@@ -14,6 +14,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <mutex>
 #include <stdexcept>
 #include <vector>
 
@@ -31,6 +32,57 @@ inline int get_tn(int N) {
 
 static int round_up_32(int x) {
     return (x + 31) / 32 * 32;
+}
+
+static RPPdeviceptr rpp_flash_attn_prepare_lut_workspace(rpp_kernel_context & ctx, int lut_elements) {
+    static std::mutex   mutex;
+    static RPPdeviceptr kernel_lut_workspace = 0;
+
+    std::lock_guard<std::mutex> lock(mutex);
+    const int lut_bytes   = lut_elements * (int) sizeof(uint16_t);
+    const int total_bytes = lut_bytes * 2;
+
+    if (kernel_lut_workspace == 0) {
+        if (rtMalloc((void **) &kernel_lut_workspace, total_bytes) != rtSuccess) {
+            throw std::runtime_error("Failed to allocate flash attention shared LUT workspace.");
+        }
+
+        std::vector<uint16_t> exp_table(lut_elements);
+        for (uint32_t i = 0; i < (uint32_t) lut_elements; i++) {
+            uint32_t x = i;
+            x <<= 16;
+            float y;
+            memcpy(&y, &x, sizeof(y));
+            y            = std::exp(y);
+            exp_table[i] = rpp::bfloat16::round_to_bfloat16(y).value;
+        }
+
+        std::vector<uint16_t> div_table(lut_elements);
+        for (uint32_t i = 0; i < (uint32_t) lut_elements; i++) {
+            uint32_t x = i;
+            x <<= 16;
+            float y;
+            memcpy(&y, &x, sizeof(y));
+            y            = 1.0f / y;
+            div_table[i] = rpp::bfloat16::round_to_bfloat16(y).value;
+        }
+        div_table[0]      = 0;
+        div_table[0x8000] = 0;
+
+        rtMemcpy((void *) kernel_lut_workspace, (const void *) exp_table.data(), lut_bytes, rtMemcpyHostToDevice);
+        rtMemcpy((void *) (kernel_lut_workspace + lut_bytes), (const void *) div_table.data(), lut_bytes,
+                 rtMemcpyHostToDevice);
+    }
+
+    RPPdeviceptr dev_lut_workspace = ctx.dev_workspace;
+    if (dev_lut_workspace == 0) {
+        ctx.dev_workspace = kernel_lut_workspace;
+        return kernel_lut_workspace;
+    }
+    if (dev_lut_workspace != kernel_lut_workspace) {
+        rtMemcpy((void *) dev_lut_workspace, (const void *) kernel_lut_workspace, total_bytes, rtMemcpyDeviceToDevice);
+    }
+    return dev_lut_workspace;
 }
 
 static int choose_softmax_row_tile(int total_rows) {
@@ -51,6 +103,12 @@ static int choose_softmax_row_tile(int total_rows) {
 
 static constexpr int kFlashAttnSramLimitBytes     = 22 * 1024 * 1024;
 static constexpr int FLASH_VXM_SMALL_KV_THRESHOLD = 512;
+
+static uint32_t rpp_flash_attn_scale_bits(float scale) {
+    uint32_t scale_bits = 0;
+    memcpy(&scale_bits, &scale, sizeof(scale_bits));
+    return scale_bits;
+}
 
 static int64_t round_up_sram_bytes(int64_t bytes) {
     return (bytes + LOADALN_GUARD - 1) / LOADALN_GUARD * LOADALN_GUARD + LOADALN_GUARD;
@@ -395,33 +453,8 @@ static void rpp_flash_atten_build_impl(rpp_kernel_context & ctx,
     const RPPdeviceptr    devQBase = devQ;
     const RPPdeviceptr    devOBase = devO;
 
-    // build exp table
-    int        lut_elements = 64 * 1024;
-    uint16_t * exp_table    = (uint16_t *) malloc(lut_elements * sizeof(uint16_t));
-    for (uint32_t i = 0; i < lut_elements; i++) {
-        uint32_t x = i;
-        x <<= 16;
-        float y      = std::exp(*(float *) &x);
-        exp_table[i] = rpp::bfloat16::round_to_bfloat16(y).value;
-    }
-
-    // build rcp table
-    uint16_t * div_table = (uint16_t *) malloc(lut_elements * sizeof(uint16_t));
-    for (uint32_t i = 0; i < lut_elements; i++) {
-        uint32_t x = i;
-        x <<= 16;
-        float y      = 1.0f / (*(float *) &x);
-        div_table[i] = rpp::bfloat16::round_to_bfloat16(y).value;
-    }
-    // 0, -0
-    div_table[0]      = 0;
-    div_table[0x8000] = 0;
-
-    RPPdeviceptr dev_exp_lut = ctx.dev_workspace;
-    RPPdeviceptr dev_div_lut = dev_exp_lut + lut_elements * sizeof(short);
-
-    rtMemcpy((void *) dev_exp_lut, (const void *) exp_table, lut_elements * sizeof(short), rtMemcpyHostToDevice);
-    rtMemcpy((void *) dev_div_lut, (const void *) div_table, lut_elements * sizeof(short), rtMemcpyHostToDevice);
+    const int    lut_elements = 64 * 1024;
+    RPPdeviceptr dev_lut_base = rpp_flash_attn_prepare_lut_workspace(ctx, lut_elements);
 
     const int  Dp           = round_up_32(D);
     const bool use_padded_d = (Dp != D);
@@ -436,7 +469,7 @@ static void rpp_flash_atten_build_impl(rpp_kernel_context & ctx,
 
     rppStreamBeginCapture(ctx.kernelStream, RPP_STREAM_CAPTURE_MODE_GLOBAL);
     RPPmodule cuMod;
-    rppModuleLoad(&ctx.rppBinMod, "rpp_kernel/flash_atten.o");
+    rpp_module_load_once(ctx.rppBinMod, "rpp_kernel/flash_atten.o");
     // -------------------------
     // SRAM allocation planning
     // -------------------------
@@ -493,10 +526,10 @@ static void rpp_flash_atten_build_impl(rpp_kernel_context & ctx,
     // }
     // std::cout << "] sram=" << total_sram_bytes << "/" << SRAM_LIMIT << " bytes\n";
 
-    rtMemcpyAsync((void *) exp_table_addr, (const void *) dev_exp_lut, lut_elements * 2, rtMemcpyDeviceToSram,
+    rtMemcpyAsync((void *) exp_table_addr, (const void *) dev_lut_base, lut_elements * 2, rtMemcpyDeviceToSram,
                   ctx.kernelStream);
-    rtMemcpyAsync((void *) reciprocal_table_addr, (const void *) dev_div_lut, lut_elements * 2, rtMemcpyDeviceToSram,
-                  ctx.kernelStream);
+    rtMemcpyAsync((void *) reciprocal_table_addr, (const void *) (dev_lut_base + lut_elements * sizeof(short)),
+                  lut_elements * 2, rtMemcpyDeviceToSram, ctx.kernelStream);
 
     int          group          = Hq / Hkv;
     const size_t q_row_bytes    = (size_t) D * (size_t) io_bytes_per_elem;
@@ -558,10 +591,10 @@ static void rpp_flash_atten_build_impl(rpp_kernel_context & ctx,
             const int TqTile       = next_query_tile_rows(Tq - q_start, Tq_tile_capacity, Dp);
             const int sizeQTile    = TqTile * Dp * io_bytes_per_elem;
             const int sizeMaskTile = TqTile * Tk * mask_bytes_per_elem;
-            const RPPdeviceptr sramMaskBf16Stage = (mask_bytes_per_elem == (int)sizeof(float)) ? sramMaskr : sramMask;
-            const RPPdeviceptr sramMaskHw32Stage = (mask_bytes_per_elem == (int)sizeof(float)) ? sramMask : sramMaskr;
-            const RPPdeviceptr sramQBf16Stage = (io_bytes_per_elem == (int)sizeof(float)) ? sramQr : sramQ;
-            const RPPdeviceptr sramQHw32Stage = (io_bytes_per_elem == (int)sizeof(float)) ? sramQ : sramQr;
+            const RPPdeviceptr sramMaskBf16Stage = sramMask;
+            const RPPdeviceptr sramMaskHw32Stage = sramMaskr;
+            const RPPdeviceptr sramQBf16Stage    = sramQ;
+            const RPPdeviceptr sramQHw32Stage    = sramQr;
             
             rtMemcpyAsync((void *) sramMask, (const void *) (devMask + (size_t) q_start * mask_row_bytes), sizeMaskTile,
                           rtMemcpyDeviceToSram, ctx.kernelStream);
@@ -896,12 +929,13 @@ static void rpp_flash_atten_build_impl(rpp_kernel_context & ctx,
         }
     }
 
-    free(exp_table);
-    free(div_table);
     // End capture after all enqueued work is defined
     rppStreamEndCapture(ctx.kernelStream, &ctx.graph);
-    if (is_instantial) {
-        rppGraphInstantiate(&ctx.graphexec, ctx.graph, NULL, NULL, 0);
+    const std::string graph_key = rpp_join_function_name_and_args(
+        __func__, Tq, Tk, Hq, Hkv, D, rpp_flash_attn_scale_bits(scale), kv_bytes_per_elem, io_bytes_per_elem,
+        mask_bytes_per_elem);
+    if (rpp_graph_instantiate(ctx.graphexec, ctx.graph, graph_key.c_str(), is_instantial) != RPP_SUCCESS) {
+        throw std::runtime_error("rpp_graph_instantiate failed.");
     }
 }
 
@@ -934,37 +968,12 @@ void rpp_flash_atten_build_vxm(rpp_kernel_context & ctx,
     RPPdeviceptr          devV    = ctx.dev_in[2];
     RPPdeviceptr          devMask = ctx.dev_in[3];
 
-    // build exp table
-    const int  lut_elements = 64 * 1024;
-    uint16_t * exp_table    = (uint16_t *) malloc(lut_elements * sizeof(uint16_t));
-    for (uint32_t i = 0; i < lut_elements; i++) {
-        uint32_t x = i;
-        x <<= 16;
-        float y      = std::exp(*(float *) &x);
-        exp_table[i] = rpp::bfloat16::round_to_bfloat16(y).value;
-    }
-
-    // build rcp table
-    uint16_t * div_table = (uint16_t *) malloc(lut_elements * sizeof(uint16_t));
-    for (uint32_t i = 0; i < lut_elements; i++) {
-        uint32_t x = i;
-        x <<= 16;
-        float y      = 1.0f / (*(float *) &x);
-        div_table[i] = rpp::bfloat16::round_to_bfloat16(y).value;
-    }
-    // 0, -0
-    div_table[0]      = 0;
-    div_table[0x8000] = 0;
-
-    RPPdeviceptr dev_exp_lut = ctx.dev_workspace;
-    RPPdeviceptr dev_div_lut = dev_exp_lut + lut_elements * sizeof(short);
-
-    rtMemcpy((void *) dev_exp_lut, (const void *) exp_table, lut_elements * sizeof(short), rtMemcpyHostToDevice);
-    rtMemcpy((void *) dev_div_lut, (const void *) div_table, lut_elements * sizeof(short), rtMemcpyHostToDevice);
+    const int    lut_elements = 64 * 1024;
+    RPPdeviceptr dev_lut_base = rpp_flash_attn_prepare_lut_workspace(ctx, lut_elements);
 
     //flashopt
     rppStreamBeginCapture(ctx.kernelStream, RPP_STREAM_CAPTURE_MODE_GLOBAL);
-    rppModuleLoad(&ctx.rppBinMod, "rpp_kernel/flash_atten_vxm.o");
+    rpp_module_load_once(ctx.rppBinMod, "rpp_kernel/flash_atten_vxm.o");
 
     // -------------------------
     // SRAM allocation planning
@@ -1023,10 +1032,10 @@ void rpp_flash_atten_build_vxm(rpp_kernel_context & ctx,
         std::abort();
     }
 
-    rtMemcpyAsync((void *) exp_table_addr, (const void *) dev_exp_lut, lut_elements * 2, rtMemcpyDeviceToSram,
+    rtMemcpyAsync((void *) exp_table_addr, (const void *) dev_lut_base, lut_elements * 2, rtMemcpyDeviceToSram,
                   ctx.kernelStream);
-    rtMemcpyAsync((void *) reciprocal_table_addr, (const void *) dev_div_lut, lut_elements * 2, rtMemcpyDeviceToSram,
-                  ctx.kernelStream);
+    rtMemcpyAsync((void *) reciprocal_table_addr, (const void *) (dev_lut_base + lut_elements * sizeof(short)),
+                  lut_elements * 2, rtMemcpyDeviceToSram, ctx.kernelStream);
     rtMemcpyAsync((void *) sramMaskRaw, (const void *) devMask, sizeMask, rtMemcpyDeviceToSram, ctx.kernelStream);
 
     if (mask_bytes_per_elem == sizeof(float)) {
@@ -1363,12 +1372,13 @@ void rpp_flash_atten_build_vxm(rpp_kernel_context & ctx,
                         group, rtMemcpySramToDevice, ctx.kernelStream);
     }
 
-    free(exp_table);
-    free(div_table);
     // End capture after all enqueued work is defined
     rppStreamEndCapture(ctx.kernelStream, &ctx.graph);
-    if (is_instantial) {
-        rppGraphInstantiate(&ctx.graphexec, ctx.graph, NULL, NULL, 0);
+    const std::string graph_key = rpp_join_function_name_and_args(
+        __func__, Tq, Tk, Hq, Hkv, D, rpp_flash_attn_scale_bits(scale), kv_bytes_per_elem, io_bytes_per_elem,
+        mask_bytes_per_elem);
+    if (rpp_graph_instantiate(ctx.graphexec, ctx.graph, graph_key.c_str(), is_instantial) != RPP_SUCCESS) {
+        throw std::runtime_error("rpp_graph_instantiate failed.");
     }
 }
 
@@ -1953,7 +1963,7 @@ static void rpp_flash_atten_build_vxm_v1_tiled_hkv(rpp_kernel_context & ctx,
     };
 
     rppStreamBeginCapture(ctx.kernelStream, RPP_STREAM_CAPTURE_MODE_GLOBAL);
-    rppModuleLoad(&ctx.rppBinMod, "rpp_kernel/flash_atten_vxm.o");
+    rpp_module_load_once(ctx.rppBinMod, "rpp_kernel/flash_atten_vxm.o");
     rppEventRecord(ctx.kernel_done_ping[0], ctx.kernelStream);
     rppEventRecord(ctx.kernel_done_ping[1], ctx.kernelStream);
 
@@ -1984,8 +1994,11 @@ static void rpp_flash_atten_build_vxm_v1_tiled_hkv(rpp_kernel_context & ctx,
     }
 
     rppStreamEndCapture(ctx.kernelStream, &ctx.graph);
-    if (is_instantial) {
-        rppGraphInstantiate(&ctx.graphexec, ctx.graph, NULL, NULL, 0);
+    const std::string graph_key = rpp_join_function_name_and_args(
+        __func__, Tk, Hq, Hkv, D, rpp_flash_attn_scale_bits(scale), io_bytes_per_elem, mask_bytes_per_elem,
+        hkv_tile_max);
+    if (rpp_graph_instantiate(ctx.graphexec, ctx.graph, graph_key.c_str(), is_instantial) != RPP_SUCCESS) {
+        throw std::runtime_error("rpp_graph_instantiate failed.");
     }
 }
 
@@ -2023,30 +2036,8 @@ void rpp_flash_atten_build_vxm_v1(rpp_kernel_context & ctx,
     RPPdeviceptr          devV    = ctx.dev_in[2];
     RPPdeviceptr          devMask = ctx.dev_in[3];
 
-    const int  lut_elements = 64 * 1024;
-    uint16_t * exp_table    = (uint16_t *) malloc(lut_elements * sizeof(uint16_t));
-    for (uint32_t i = 0; i < lut_elements; i++) {
-        uint32_t x = i;
-        x <<= 16;
-        float y      = std::exp(*(float *) &x);
-        exp_table[i] = rpp::bfloat16::round_to_bfloat16(y).value;
-    }
-
-    uint16_t * div_table = (uint16_t *) malloc(lut_elements * sizeof(uint16_t));
-    for (uint32_t i = 0; i < lut_elements; i++) {
-        uint32_t x = i;
-        x <<= 16;
-        float y      = 1.0f / (*(float *) &x);
-        div_table[i] = rpp::bfloat16::round_to_bfloat16(y).value;
-    }
-    div_table[0]      = 0;
-    div_table[0x8000] = 0;
-
-    RPPdeviceptr dev_exp_lut = ctx.dev_workspace;
-    RPPdeviceptr dev_div_lut = dev_exp_lut + lut_elements * sizeof(short);
-
-    rtMemcpy((void *) dev_exp_lut, (const void *) exp_table, lut_elements * sizeof(short), rtMemcpyHostToDevice);
-    rtMemcpy((void *) dev_div_lut, (const void *) div_table, lut_elements * sizeof(short), rtMemcpyHostToDevice);
+    const int    lut_elements = 64 * 1024;
+    RPPdeviceptr dev_lut_base = rpp_flash_attn_prepare_lut_workspace(ctx, lut_elements);
 
     int hkv_tile_max = Hkv;
     if (const char * tile_env = std::getenv("GGML_FLASH_HKV_TILE_MAX")) {
@@ -2064,15 +2055,13 @@ void rpp_flash_atten_build_vxm_v1(rpp_kernel_context & ctx,
 
     if (((Hkv + hkv_tile_max - 1) / hkv_tile_max) > 1) {
         rpp_flash_atten_build_vxm_v1_tiled_hkv(ctx, Tk, Hq, Hkv, D, scale, io_bytes_per_elem, mask_bytes_per_elem, devQ,
-                                               devK, devV, devMask, dev_exp_lut, dev_div_lut, lut_elements,
-                                               hkv_tile_max);
-        free(exp_table);
-        free(div_table);
+                                               devK, devV, devMask, dev_lut_base,
+                                               dev_lut_base + lut_elements * sizeof(short), lut_elements, hkv_tile_max);
         return;
     }
 
     rppStreamBeginCapture(ctx.kernelStream, RPP_STREAM_CAPTURE_MODE_GLOBAL);
-    rppModuleLoad(&ctx.rppBinMod, "rpp_kernel/flash_atten_vxm.o");
+    rpp_module_load_once(ctx.rppBinMod, "rpp_kernel/flash_atten_vxm.o");
     // Join dmaStream into the capture graph before issuing staged DMA work.
     rppEventRecord(ctx.kernel_done_ping[0], ctx.kernelStream);
     rppStreamWaitEvent(ctx.dmaStream, ctx.kernel_done_ping[0], 0);
@@ -2199,10 +2188,10 @@ void rpp_flash_atten_build_vxm_v1(rpp_kernel_context & ctx,
     rppEventRecord(ctx.dma_done_ping[1], ctx.dmaStream);
 
     // Stage 3: LUT/mask become live after the first MM starts.
-    rtMemcpyAsync((void *) exp_table_addr, (const void *) dev_exp_lut, lut_elements * 2, rtMemcpyDeviceToSram,
+    rtMemcpyAsync((void *) exp_table_addr, (const void *) dev_lut_base, lut_elements * 2, rtMemcpyDeviceToSram,
                   ctx.dmaStream);
-    rtMemcpyAsync((void *) reciprocal_table_addr, (const void *) dev_div_lut, lut_elements * 2, rtMemcpyDeviceToSram,
-                  ctx.dmaStream);
+    rtMemcpyAsync((void *) reciprocal_table_addr, (const void *) (dev_lut_base + lut_elements * sizeof(short)),
+                  lut_elements * 2, rtMemcpyDeviceToSram, ctx.dmaStream);
     rtMemcpyAsync((void *) sramMaskRaw, (const void *) devMask, sizeMask, rtMemcpyDeviceToSram, ctx.dmaStream);
     rppEventRecord(ctx.kernel_done_ping[0], ctx.dmaStream);
 
@@ -2606,11 +2595,12 @@ void rpp_flash_atten_build_vxm_v1(rpp_kernel_context & ctx,
     rtMemcpy2DAsync((void *) heads[0].devOGroup, out_group_bytes, (const void *) heads[0].sramOutStage,
                     out_stage_stride_bytes, out_group_bytes, Hkv, rtMemcpySramToDevice, ctx.kernelStream);
 
-    free(exp_table);
-    free(div_table);
     rppStreamEndCapture(ctx.kernelStream, &ctx.graph);
-    if (is_instantial) {
-        rppGraphInstantiate(&ctx.graphexec, ctx.graph, NULL, NULL, 0);
+    const std::string graph_key = rpp_join_function_name_and_args(
+        __func__, Tq, Tk, Hq, Hkv, D, rpp_flash_attn_scale_bits(scale), kv_bytes_per_elem, io_bytes_per_elem,
+        mask_bytes_per_elem);
+    if (rpp_graph_instantiate(ctx.graphexec, ctx.graph, graph_key.c_str(), is_instantial) != RPP_SUCCESS) {
+        throw std::runtime_error("rpp_graph_instantiate failed.");
     }
 }
 

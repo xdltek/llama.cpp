@@ -444,28 +444,6 @@ static bool ggml_rpp_export_forward_dims_is_same(ggml_tensor *   gate,
     return true;
 }
 
-static RPPdeviceptr ggml_rpp_prepare_quant_workspace(rpp_kernel_context & ctx, ggml_tensor * weight) {
-    if (weight == nullptr) {
-        return 0;
-    }
-    switch (weight->type) {
-        case GGML_TYPE_IQ2_S:
-            return kernel_q2_s_nolut::q2s_nolut_prepare_lut_workspace(ctx);
-        case GGML_TYPE_IQ2_XS:
-            return kernel_q2_xs_nolut::q2xs_nolut_prepare_lut_workspace(ctx);
-        case GGML_TYPE_IQ3_XXS:
-            return kernel_q3_xxs_nolut::q3xxs_nolut_prepare_lut_workspace(ctx);
-        default:
-            GGML_LOG_ERROR("%s: unsupported weight type: %s\n", __func__, ggml_type_name(weight->type));
-            GGML_ASSERT(false);
-            return 0;
-    }
-}
-
-static RPPdeviceptr ggml_rpp_prepare_silu_workspace(rpp_kernel_context & ctx) {
-    return kernel_swiglu::silu_prepare_lut_workspace(ctx);
-}
-
 static bool ggml_rpp_create_kernel_export_forward(ggml_backend_rpp_context & ctx,
                                                   ggml_rpp_node *            rpp_base_node,
                                                   ggml_tensor *              gate,
@@ -576,26 +554,6 @@ static bool ggml_rpp_create_kernel_export_forward(ggml_backend_rpp_context & ctx
         return false;
     }
 
-    if (rpp_node->kernel_ctx->dev_workspace == 0) {
-        rpp_node->kernel_ctx->dev_workspace = (RPPdeviceptr) (ctx.pool().alloc(rpp_node->workspace_size * 4));
-        GGML_ASSERT(rpp_node->kernel_ctx->dev_workspace != 0);
-        auto &             cur_kernel_ctx     = *(rpp_node->kernel_ctx.get());
-        const RPPdeviceptr dev_workspace_base = cur_kernel_ctx.dev_workspace;
-        const size_t       workspace_offset   = (64 * 1024) * sizeof(uint16_t);
-        cur_kernel_ctx.dev_workspace          = ggml_rpp_prepare_quant_workspace(cur_kernel_ctx, gate->src[0]);
-        GGML_ASSERT(cur_kernel_ctx.dev_workspace != 0);
-        cur_kernel_ctx.dev_workspace += workspace_offset;
-        cur_kernel_ctx.dev_workspace = ggml_rpp_prepare_quant_workspace(cur_kernel_ctx, up->src[0]);
-        GGML_ASSERT(cur_kernel_ctx.dev_workspace != 0);
-        cur_kernel_ctx.dev_workspace += workspace_offset;
-        cur_kernel_ctx.dev_workspace = ggml_rpp_prepare_quant_workspace(cur_kernel_ctx, down->src[0]);
-        GGML_ASSERT(cur_kernel_ctx.dev_workspace != 0);
-        cur_kernel_ctx.dev_workspace += workspace_offset;
-        cur_kernel_ctx.dev_workspace = ggml_rpp_prepare_silu_workspace(cur_kernel_ctx);
-        GGML_ASSERT(cur_kernel_ctx.dev_workspace != 0);
-        cur_kernel_ctx.dev_workspace = dev_workspace_base;
-    }
-
     rpp_node->kernel_ctx->dev_in.clear();
     rpp_node->kernel_ctx->dev_out.clear();
     rpp_node->kernel_ctx->dev_in.emplace_back((RPPdeviceptr) gate->src[1]->data);
@@ -626,9 +584,8 @@ static bool ggml_rpp_create_kernel_export_forward(ggml_backend_rpp_context & ctx
         rpp_node->kernel_ctx_next = std::make_shared<rpp_kernel_context>();
         rpp_init_kernel_ctx(*(rpp_node->kernel_ctx_next.get()));
     }
-    rpp_node->kernel_ctx_next->dev_workspace = rpp_node->kernel_ctx->dev_workspace;
-    rpp_node->kernel_ctx_next->dev_in        = rpp_node->kernel_ctx->dev_in;
-    rpp_node->kernel_ctx_next->dev_out       = rpp_node->kernel_ctx->dev_out;
+    rpp_node->kernel_ctx_next->dev_in  = rpp_node->kernel_ctx->dev_in;
+    rpp_node->kernel_ctx_next->dev_out = rpp_node->kernel_ctx->dev_out;
     kernel_expert_forward::rpp_matmul_id_fusion_build(
         *(rpp_node->kernel_ctx_next.get()), rpp_node->plan_next, B, K, N, nr_of_experts, in_bytes_per_element,
         out_bytes_per_element, gate_layout.quant_kind, up_layout.quant_kind, down_layout.quant_kind);
@@ -1261,20 +1218,15 @@ static bool ggml_rpp_build_expert_forward_vxm_graph(rpp_kernel_export_forward * 
                     const RPPdeviceptr base_ptr     = kernel_ctx->dev_workspace;
                     const size_t       qscale_bytes = q3xxs_vxm_nolut_lut_workspace::qscale_lut_bytes;
                     const size_t       mag_bytes    = q3xxs_vxm_nolut_lut_workspace::mag_lut_bytes;
-                    const size_t       mat_bytes    = q3xxs_vxm_nolut_lut_workspace::mat_lut_bytes;
                     const size_t       off_qscale   = 0;
                     const size_t       off_mag      = kernel_q3_xxs_vxm_nolut::align_up(off_qscale + qscale_bytes, 64);
-                    const size_t       off_mat      = kernel_q3_xxs_vxm_nolut::align_up(off_mag + mag_bytes, 64);
 
                     dst_sram.emplace_back(kernel_ctx->dev_in[5]);
                     dst_sram.emplace_back(kernel_ctx->dev_in[6]);
-                    dst_sram.emplace_back(kernel_ctx->dev_in[7]);
                     src_devi.emplace_back(base_ptr + (RPPdeviceptr) off_qscale);
                     src_devi.emplace_back(base_ptr + (RPPdeviceptr) off_mag);
-                    src_devi.emplace_back(base_ptr + (RPPdeviceptr) off_mat);
                     byte_count.emplace_back(qscale_bytes);
                     byte_count.emplace_back(mag_bytes);
-                    byte_count.emplace_back(mat_bytes);
                 }
                 break;
             default:
@@ -1362,7 +1314,7 @@ static bool ggml_rpp_build_expert_forward_vxm_graph(rpp_kernel_export_forward * 
                                          cfg.down_o_type_size, cfg.experts, 0, 0);
 
     if (ctx4->rppBinMod == 0) {
-        RPP_CHECK(rppModuleLoad(&ctx4->rppBinMod, "rpp_kernel/topk_combine.o"));
+        RPP_CHECK(rpp_module_load_once(ctx4->rppBinMod, "rpp_kernel/topk_combine.o"));
     }
     RPP_CHECK(rppStreamWaitEvent(ctx0->kernelStream, topk_input_ready, 0));
     ggml_rpp_launch_moe_topk_combine_slot_major(io->sram_out_down, io->sram_out_div, cfg.div_o_type_size,
@@ -1382,7 +1334,12 @@ static bool ggml_rpp_build_expert_forward_vxm_graph(rpp_kernel_export_forward * 
         ggml_rpp_bind_weight_update_node(ctx0->graph, binding);
     }
 
-    RPP_CHECK(rppGraphInstantiate(&ctx0->graphexec, ctx0->graph, NULL, NULL, 0));
+    const std::string graph_key = rpp_join_function_name_and_args(
+        __func__, cfg.mode, cfg.C, cfg.H, cfg.W, cfg.M0, cfg.K0, cfg.N0, cfg.K1, cfg.N1, cfg.K3, cfg.N3, cfg.experts,
+        cfg.gate_i_type_size, cfg.gate_o_type_size, cfg.up_i_type_size, cfg.up_o_type_size, cfg.glu_i_type_size0,
+        cfg.glu_o_type_size, cfg.down_i_type_size, cfg.down_o_type_size, cfg.div_o_type_size, cfg.add_o_type_size,
+        cfg.size_act, (int) mul_gate->src[0]->type, (int) mul_up->src[0]->type, (int) mul_down->src[0]->type);
+    RPP_CHECK(rpp_graph_instantiate(ctx0->graphexec, ctx0->graph, graph_key.c_str(), fusion_node->is_instantial));
     return true;
 }
 
@@ -1449,27 +1406,17 @@ static bool ggml_rpp_create_kernel_export_forward_vxm(ggml_backend_rpp_context &
 
     const uint32_t     size_act = (uint32_t) ((size_t) experts * (size_t) M0 * (size_t) K0 * (size_t) gate_i_type_size);
     const RPPdeviceptr fusion_sram_base = fusion_node->kernel_ctx->virtual_sram_base;
-    if (!fusion_node->kernel_ctx->dev_workspace) {
-        fusion_node->kernel_ctx->dev_workspace = (RPPdeviceptr) (ctx.pool().alloc(fusion_node->workspace_size));
-        GGML_ASSERT(fusion_node->kernel_ctx->dev_workspace != 0);
-    }
     if (!fusion_node->kernel_ctx_up) {
         fusion_node->kernel_ctx_up = std::make_shared<rpp_kernel_context>();
         rpp_init_kernel_ctx(*(fusion_node->kernel_ctx_up.get()));
-        fusion_node->kernel_ctx_up->dev_workspace = (RPPdeviceptr) (ctx.pool().alloc(fusion_node->workspace_size));
-        GGML_ASSERT(fusion_node->kernel_ctx_up->dev_workspace != 0);
     }
     if (!fusion_node->kernel_ctx_down) {
         fusion_node->kernel_ctx_down = std::make_shared<rpp_kernel_context>();
         rpp_init_kernel_ctx(*(fusion_node->kernel_ctx_down.get()));
-        fusion_node->kernel_ctx_down->dev_workspace = (RPPdeviceptr) (ctx.pool().alloc(fusion_node->workspace_size));
-        GGML_ASSERT(fusion_node->kernel_ctx_down->dev_workspace != 0);
     }
     if (!fusion_node->kernel_ctx_glu) {
         fusion_node->kernel_ctx_glu = std::make_shared<rpp_kernel_context>();
         rpp_init_kernel_ctx(*(fusion_node->kernel_ctx_glu.get()));
-        fusion_node->kernel_ctx_glu->dev_workspace = (RPPdeviceptr) (ctx.pool().alloc(fusion_node->workspace_size));
-        GGML_ASSERT(fusion_node->kernel_ctx_glu->dev_workspace != 0);
     }
     if (!fusion_node->kernel_ctx_topk) {
         fusion_node->kernel_ctx_topk = std::make_shared<rpp_kernel_context>();
@@ -1649,6 +1596,7 @@ static bool ggml_rpp_get_expert_forward_route_info(rpp_kernel_export_forward * r
 static bool ggml_rpp_copy_expert_forward_inputs_to_sram(rpp_kernel_context &                               kernel_ctx,
                                                         const kernel_expert_forward::fusion_runtime_plan & plan,
                                                         RPPstream                                          stream) {
+    (void) kernel_ctx;
     std::vector<RPPdeviceptr> src_ddr;
     std::vector<RPPdeviceptr> dst_sram;
     std::vector<size_t>       byte_count;
@@ -1659,9 +1607,6 @@ static bool ggml_rpp_copy_expert_forward_inputs_to_sram(rpp_kernel_context &    
         byte_count.push_back(bytes);
     };
 
-    const RPPdeviceptr dev_workspace_base = kernel_ctx.dev_workspace;
-    const size_t       workspace_offset   = (64 * 1024) * sizeof(uint16_t);
-
     auto copy_sparse_input_to_sram = [&]() {
         const size_t sparse_f32_bytes  = (size_t) plan.B * (size_t) plan.K * sizeof(float);
         const size_t sparse_bf16_bytes = (size_t) plan.B * (size_t) plan.K * sizeof(uint16_t);
@@ -1671,24 +1616,28 @@ static bool ggml_rpp_copy_expert_forward_inputs_to_sram(rpp_kernel_context &    
             enqueue_d2s_copy(plan.inputs.sparse_act, plan.io.sparse_bf16, sparse_bf16_bytes);
         }
     };
-    auto copy_quant_lut_to_sram = [&](RPPdeviceptr                                         dev_lut_workspace,
-                                      const kernel_expert_forward::quant_lut_sram_window & lut, int quant) {
+    auto copy_quant_lut_to_sram = [&](const kernel_expert_forward::quant_lut_sram_window & lut, int quant) {
+        const RPPdeviceptr dev_lut_workspace = kernel_expert_forward::prepare_quant_lut_workspace(quant);
+        GGML_ASSERT(dev_lut_workspace != 0);
         const size_t qscale_bytes = kernel_expert_forward::quant_qscale_lut_bytes(quant);
         const size_t mag_bytes    = kernel_expert_forward::quant_mag_lut_bytes(quant);
         enqueue_d2s_copy(dev_lut_workspace, lut.qscale, qscale_bytes);
         enqueue_d2s_copy(dev_lut_workspace + qscale_bytes, lut.mag, mag_bytes);
     };
-    auto copy_silu_lut_to_sram = [&](RPPdeviceptr dev_lut_workspace) {
+    auto copy_silu_lut_to_sram = [&]() {
+        rpp_kernel_context silu_ctx{};
+        const RPPdeviceptr dev_lut_workspace = kernel_swiglu::silu_prepare_lut_workspace(silu_ctx);
+        GGML_ASSERT(dev_lut_workspace != 0);
         enqueue_d2s_copy(dev_lut_workspace, plan.io.silu_lut, kernel_expert_forward::kSiluLutBytes);
     };
 
     copy_sparse_input_to_sram();
-    copy_quant_lut_to_sram(dev_workspace_base, plan.io.gate_lut, plan.mat0_quant);
-    copy_quant_lut_to_sram(dev_workspace_base + workspace_offset, plan.io.up_lut, plan.mat1_quant);
+    copy_quant_lut_to_sram(plan.io.gate_lut, plan.mat0_quant);
+    copy_quant_lut_to_sram(plan.io.up_lut, plan.mat1_quant);
     if (plan.has_down_stage) {
-        copy_quant_lut_to_sram(dev_workspace_base + workspace_offset * 2, plan.io.down_lut, plan.mat2_quant);
+        copy_quant_lut_to_sram(plan.io.down_lut, plan.mat2_quant);
     }
-    copy_silu_lut_to_sram(dev_workspace_base + workspace_offset * 3);
+    copy_silu_lut_to_sram();
     if (!dst_sram.empty()) {
         rppMemcpyLinkDtoSAsync(dst_sram.data(), src_ddr.data(), byte_count.data(), dst_sram.size(), stream);
     }

@@ -5,25 +5,6 @@ static int ggml_rpp_div_seq_len(ggml_tensor * dst, ggml_rpp_node * node) {
     return dst->ne[node->seq_len_index];
 }
 
-static ggml_rpp_node * ggml_rpp_find_div_node(ggml_backend_rpp_context & ctx, ggml_tensor * dst) {
-    for (auto & graph_iter : ctx.gglm_graphs) {
-        ggml_rpp_cgraph * rpp_graph_tmp = ctx.rpp_graphs[graph_iter].get();
-        if (!rpp_graph_tmp) {
-            continue;
-        }
-        for (auto & node_iter : rpp_graph_tmp->rpp_nodes) {
-            if (node_iter.first != dst && node_iter.first->op == GGML_OP_DIV) {
-                auto & node_vec = node_iter.second;
-                for (size_t i = 0; i < node_vec.size(); i++) {
-                    auto cur_node = node_vec[i].get();
-                    return cur_node;
-                }
-            }
-        }
-    }
-    return nullptr;
-}
-
 static bool ggml_rpp_create_kernel_div(ggml_backend_rpp_context & ctx,
                                        ggml_rpp_node *            rpp_base_node,
                                        ggml_tensor *              dst) {
@@ -75,13 +56,6 @@ static bool ggml_rpp_create_kernel_div(ggml_backend_rpp_context & ctx,
     const int i_type_size_1 = ggml_rpp_get_io_type_size(ctx, dst->src[1], 0);
     const int o_type_size   = ggml_rpp_get_io_type_size(ctx, dst, 1);
 
-    auto ori_rpp_node = ggml_rpp_find_div_node(ctx, dst);
-    if (ori_rpp_node) {
-        auto ori_rms_node = static_cast<rpp_kernel_div *>(ori_rpp_node);
-        rpp_node->init_workspace(ori_rms_node->kernel_ctx->dev_workspace);
-    } else {
-        rpp_node->init_workspace(ctx);
-    }
     // build kernel
     rpp_elementwise_build(*(rpp_node->kernel_ctx.get()), RPP_ELEMWISE_DIV, C, H, W, axis, i_type_size_0, i_type_size_1,
                           o_type_size, 1, rpp_node->is_instantial);

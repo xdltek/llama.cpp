@@ -5,25 +5,6 @@ static int ggml_rpp_rms_norm_seq_len(ggml_tensor * dst, ggml_rpp_node * node) {
     return dst->ne[node->seq_len_index];
 }
 
-static ggml_rpp_node * ggml_rpp_find_rms_norm_node(ggml_backend_rpp_context & ctx, ggml_tensor * dst) {
-    for (auto & graph_iter : ctx.gglm_graphs) {
-        ggml_rpp_cgraph * rpp_graph_tmp = ctx.rpp_graphs[graph_iter].get();
-        if (!rpp_graph_tmp) {
-            continue;
-        }
-        for (auto & node_iter : rpp_graph_tmp->rpp_nodes) {
-            if (node_iter.first != dst && node_iter.first->op == GGML_OP_RMS_NORM) {
-                auto & node_vec = node_iter.second;
-                for (size_t i = 0; i < node_vec.size(); i++) {
-                    auto cur_node = node_vec[i].get();
-                    return cur_node;
-                }
-            }
-        }
-    }
-    return nullptr;
-}
-
 static bool ggml_rpp_rms_norm_properties_is_same(ggml_backend_rpp_context & ctx,
                                                  ggml_tensor *              dst,
                                                  ggml_rpp_node *            rpp_node) {
@@ -113,14 +94,6 @@ static bool ggml_rpp_create_kernel_rms_norm(ggml_backend_rpp_context & ctx,
     rpp_node->binding_o_buffers.emplace(dst, dst->data);
     rpp_node->binding_io_buffers.emplace_back(dst->src[0]->data);
     rpp_node->binding_io_buffers.emplace_back(dst->data);
-    // find first rms_node, and all rms_norm kernel will shared the same workspace
-    auto ori_rpp_node = ggml_rpp_find_rms_norm_node(ctx, dst);
-    if (ori_rpp_node) {
-        auto ori_rms_node = static_cast<rpp_kernel_rms_norm *>(ori_rpp_node);
-        rpp_node->init_workspace(ori_rms_node->kernel_ctx->dev_workspace);
-    } else {
-        rpp_node->init_workspace(ctx);
-    }
 
     const int i_type_size = ggml_rpp_get_io_type_size(ctx, dst->src[0], 0);
     const int o_type_size = ggml_rpp_get_io_type_size(ctx, dst, 1);

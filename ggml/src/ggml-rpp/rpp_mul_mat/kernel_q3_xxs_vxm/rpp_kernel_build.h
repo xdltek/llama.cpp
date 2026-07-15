@@ -10,10 +10,8 @@
 #include <assert.h>
 #include <rpp_runtime.h>
 
-#include <array>
 #include <csignal>
 #include <cstdint>
-#include <cstring>
 #include <iostream>
 #include <vector>
 
@@ -194,7 +192,6 @@ static void rpp_matmul_q3xxs_vxm(rpp_kernel_context & ctx,
     const int             grid_lut_elems      = 256;
     const int             qscale_lut_bytes    = qscale_lut_elems * (int) sizeof(uint16_t);
     const int             grid_lut_bytes      = grid_lut_elems * (int) sizeof(uint32_t);
-    const int             lut_workspace_bytes = qscale_lut_bytes + grid_lut_bytes;
 
     RPPdeviceptr devA              = ctx.dev_in[0];
     RPPdeviceptr devB_q4           = ctx.dev_in[1];
@@ -202,27 +199,15 @@ static void rpp_matmul_q3xxs_vxm(rpp_kernel_context & ctx,
     RPPdeviceptr devB_qsign        = ctx.dev_in[3];
     RPPdeviceptr devB_super_scale  = ctx.dev_in[4];
     RPPdeviceptr devC              = ctx.dev_out[0];
-    RPPdeviceptr dev_lut_workspace = ctx.dev_workspace;
-    assert(dev_lut_workspace != 0);
+    RPPdeviceptr dev_lut_workspace = q3xxs_vxm_prepare_lut_workspace(ctx);
 
     RPPdeviceptr devB_qscale_lut = dev_lut_workspace;
     RPPdeviceptr devB_grid_lut   = devB_qscale_lut + qscale_lut_bytes;
 
-    std::array<uint16_t, qscale_lut_elems> qscale_lut = {};
-    for (int i = 0; i < qscale_lut_elems; ++i) {
-        const float scale4  = (float) i;
-        const float lut_val = (0.5f + scale4) * 0.5f;
-        qscale_lut[i]       = float_to_bf16_rne(lut_val);
-    }
-    std::array<uint32_t, grid_lut_elems> grid_lut = {};
-    std::memcpy(grid_lut.data(), iq3xxs_grid_local, grid_lut_bytes);
-    rtMemcpy((void *) devB_qscale_lut, qscale_lut.data(), qscale_lut_bytes, rtMemcpyHostToDevice);
-    rtMemcpy((void *) devB_grid_lut, grid_lut.data(), grid_lut_bytes, rtMemcpyHostToDevice);
-
     // Capture on kernelStream (like CUDA graph capture pattern)
     rppStreamBeginCapture(ctx.kernelStream, RPP_STREAM_CAPTURE_MODE_GLOBAL);
     RPPmodule cuMod;
-    rppModuleLoad(&ctx.rppBinMod, "rpp_kernel/matmul_q3xxs_vxm.o");
+    rpp_module_load_once(ctx.rppBinMod, "rpp_kernel/matmul_q3xxs_vxm.o");
     // -------------------------
     // SRAM allocation planning
     // -------------------------
@@ -515,8 +500,9 @@ static void rpp_matmul_q3xxs_vxm(rpp_kernel_context & ctx,
 
     // End capture after all enqueued work is defined
     rppStreamEndCapture(ctx.kernelStream, &ctx.graph);
-    if (is_instantial) {
-        rppGraphInstantiate(&ctx.graphexec, ctx.graph, NULL, NULL, 0);
+    const std::string graph_key = rpp_join_function_name_and_args(__func__, M, K, N, weights_group, in_bytes_per_element, out_bytes_per_element);
+    if (rpp_graph_instantiate(ctx.graphexec, ctx.graph, graph_key.c_str(), is_instantial) != RPP_SUCCESS) {
+        throw std::runtime_error("rpp_graph_instantiate failed.");
     }
 }
 
@@ -568,7 +554,7 @@ static void rpp_matmul_q3xxs_vxm_sram(rpp_kernel_context & ctx,
     }
 
     rppStreamBeginCapture(ctx.kernelStream, RPP_STREAM_CAPTURE_MODE_GLOBAL);
-    rppModuleLoad(&ctx.rppBinMod, "rpp_kernel/matmul_q3xxs_vxm.o");
+    rpp_module_load_once(ctx.rppBinMod, "rpp_kernel/matmul_q3xxs_vxm.o");
 
     if (K % weights_group != 0) {
         throw std::runtime_error("Matmul Q3XXS SRAM expects K % weights_group == 0");
@@ -716,8 +702,9 @@ static void rpp_matmul_q3xxs_vxm_sram(rpp_kernel_context & ctx,
     }
 
     rppStreamEndCapture(ctx.kernelStream, &ctx.graph);
-    if (is_instantial) {
-        rppGraphInstantiate(&ctx.graphexec, ctx.graph, NULL, NULL, 0);
+    const std::string graph_key = rpp_join_function_name_and_args(__func__, M, K, N, weights_group, in_bytes_per_element, out_bytes_per_element, experts);
+    if (rpp_graph_instantiate(ctx.graphexec, ctx.graph, graph_key.c_str(), is_instantial) != RPP_SUCCESS) {
+        throw std::runtime_error("rpp_graph_instantiate failed.");
     }
 }
 
