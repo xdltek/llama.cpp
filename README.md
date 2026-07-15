@@ -100,7 +100,7 @@ export GGML_RPP_WEIGHTS_CACHE_FILE=$HOME/model/llama.cpp/model_cache.weights
 
 export GGML_RPP_MAX_CONTEXT=8192
 export GGML_RPP_BATCH_SIZE=512
-export GGML_RPP_STUB_KV_STEP=32
+export GGML_RPP_STUB_KV_STEP=0
 ```
 
 Reload:
@@ -126,8 +126,9 @@ cd build/bin
     --no-warmup \
     -ub 512 \
     --fit off \
-    --jinja \
-    -np 1
+    -np 1 \
+    --context-shift \
+    --keep 256 
 ```
 
 > **Note**
