@@ -68,7 +68,8 @@ cmake .. \
     -DGGML_RPP_USE_BF16=ON \
     -DGGML_RPP_USE_DFS=ON \
     -DLLAMA_CURL=OFF \
-    -DCMAKE_BUILD_TYPE=Debug
+    -DCMAKE_BUILD_TYPE=Debug \
+    -DLLAMA_BUILD_TESTS=OFF
 
 make -j$(nproc)
 ```
